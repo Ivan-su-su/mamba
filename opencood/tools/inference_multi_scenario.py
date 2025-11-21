@@ -332,7 +332,6 @@ def main():
         drop_last=False
     )
     # Setup model
-    import pdb; pdb.set_trace()
     model = setup_model(hypes, device, dataset)
     
     epoch_id, model = load_model_checkpoint(

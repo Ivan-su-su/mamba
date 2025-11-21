@@ -762,8 +762,8 @@ Ratio: {occupancy_ratio:.2%}"""
         occupancy_ratio = occupied_cells / total_cells
         
         stats_text = f"""Final Fusion Result:
-Occupied: {occupied_cells:,}/{total_cells:,}
-Ratio: {occupancy_ratio:.2%}"""
+            Occupied: {occupied_cells:,}/{total_cells:,}
+            Ratio: {occupancy_ratio:.2%}"""
         
         axes[1, -1].text(0.1, 0.9, stats_text, transform=axes[1, -1].transAxes, 
                         fontsize=9, verticalalignment='top', fontfamily='monospace')

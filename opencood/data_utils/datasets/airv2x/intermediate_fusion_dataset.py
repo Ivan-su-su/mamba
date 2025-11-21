@@ -294,6 +294,7 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
             current_agent["num_agents"] = len(retain_ids)
             
             # Merge features for this agent type if available
+           
             if current_agent["num_agents"] > 0:
                 current_agent["merged_lidar_features_dict"] = self.merge_features_to_dict(
                     current_agent["processed_lidar_features"], None, "lidar"
@@ -612,7 +613,7 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         # No supervision under such case.
         if len(lidar_np) == 0:
             object_bbx_mask = np.zeros_like(object_bbx_mask)
-            
+       
         processed_lidar = self.pre_processor.preprocess(lidar_np)
 
         selected_cav_processed.update(

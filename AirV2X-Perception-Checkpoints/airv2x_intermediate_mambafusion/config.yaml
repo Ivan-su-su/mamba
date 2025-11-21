@@ -351,8 +351,11 @@ model:
         IN_CHANNEL: 256
         OUT_CHANNEL: 80
         FEATURE_SIZE: [32,88]
-        XBOUND: [-140.8, 140.8, 0.782]
-        YBOUND: [-40.0, 40.0, 0.222]
+        # XBOUND: [-140.8, 140.8, 0.782]  # 原始配置，输出 (360, 360)
+        # YBOUND: [-40.0, 40.0, 0.222]   # 原始配置，输出 (360, 360)
+        XBOUND: [-140.8, 140.8, 0.4]   # 281.6 / 704
+        YBOUND: [-40.0, 40.0, 0.4]     # 80 / 200
+        TARGET_BEV_SIZE: [200, 704]  # 目标BEV输出尺寸，代码会自动计算步长
         ZBOUND: [-4.0, 4.0, 8.0]
         DBOUND: [1.0, 60.0, 0.5]
         DOWNSAMPLE: 1
@@ -360,7 +363,7 @@ model:
       FUSER:
         NAME: ConvFuser
         # USE_MERGE_AFTER: True
-        USE_VMAMBA: True
+        # USE_VMAMBA: True
         IN_CHANNEL: 144
         OUT_CHANNEL: 128
         LIDAR_ONLY: False

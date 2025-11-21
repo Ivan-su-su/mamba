@@ -111,10 +111,9 @@ class SpVoxelPreprocessor(BasePreprocessor):
 
         data_dict["voxel_features"] = voxels
         data_dict["voxel_coords"] = coordinates
-        data_dict["voxel_num_points"] = num_points
-
+        data_dict["voxel_num_points"] = num_points 
+        
         return data_dict
-
     def collate_batch(self, batch):
         """
         Customized pytorch data loader collate function.

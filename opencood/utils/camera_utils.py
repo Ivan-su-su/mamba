@@ -47,8 +47,7 @@ def sample_augmentation(data_aug_conf, is_train):
             flip = True
         rotate = np.random.uniform(*data_aug_conf['rot_lim'])
     else:
-        resize = np.mean(data_aug_conf['resize_lim_mamba'])
-        # resize = max(fH/H, fW/W)
+        resize = np.mean(data_aug_conf['resize_lim_mamba']) if 'resize_lim_mamba' in data_aug_conf else max(fH/H, fW/W)
         resize_dims = (int(W*resize), int(H*resize))
         newW, newH = resize_dims
         crop_h = int((1 - np.mean(data_aug_conf['bot_pct_lim']))*newH) - fH

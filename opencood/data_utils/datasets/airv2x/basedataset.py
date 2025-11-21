@@ -182,9 +182,7 @@ class BaseDataset(Dataset):
             # if "2025_04_27_17_22_41" in scenario_folder:
             #     continue  # 2025_04_27_17_22_41 has some bugs
             scenario_dict = parse_seq(scenario_folder)
-
             self.scenario_database.update({i: scenario_dict})
-
             # rsu and drone can't be ego, move them to the tail
             # make sure the first agent is always the vehicle with smallest idx
             while True:

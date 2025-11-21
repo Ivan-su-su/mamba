@@ -1448,7 +1448,6 @@ class LION3DBackboneOneStride(nn.Module):
         assert batch_dict[agent]['voxel_coords'][:, 2].max() < self.sparse_shape[1] and batch_dict[agent]['voxel_coords'][:, 2].min() >= 0
         assert batch_dict[agent]['voxel_coords'][:, 3].max() < self.sparse_shape[2] and batch_dict[agent]['voxel_coords'][:, 3].min() >= 0
         batch_dict[agent]['pillar_features'] = batch_dict[agent]['voxel_features'] = x.features
-        import pdb; pdb.set_trace()
         return batch_dict
 
     def load_template(self, path, rank):
