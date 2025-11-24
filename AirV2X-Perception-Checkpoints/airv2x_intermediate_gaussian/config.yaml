@@ -38,9 +38,7 @@ fusion: #use
       resize_lim:
       - 0.65
       - 0.7
-      resize_lim_mamba:
-      - 0.48
-      - 0.48
+
       rot_lim:
       - -3.6
       - 3.6
@@ -368,16 +366,17 @@ model:
       - 0.4
       - 0.4
       - 4
-    GRID_SIZE: [704, 200, 40]
-    VOXEL_SIZE: [0.4, 0.4, 2.0]
-    POINT_CLOUD_RANGE: [-140.8, -40.0, -70.0, 140.8, 40.0, 10.0]
+
+    GRID_SIZE: [704, 200, 16]
+    VOXEL_SIZE: [0.4, 0.4, 0.25]
+    POINT_CLOUD_RANGE: [-140.8, -40.0, -3, 140.8, 40.0, 1]
     
     BACKBONE_3D:
       NAME:  Gaussian3DBackboneSemantic
       NUM_POINT_FEATURES: 4
-      GRID_SIZE: [200, 704, 40]
-      VOXEL_SIZE: [0.4, 0.4, 2.0]
-      POINT_CLOUD_RANGE: [-140.8, -40.0, -70.0, 140.8, 40.0, 10.0]
+      GRID_SIZE: [200, 704, 16]
+      VOXEL_SIZE: [0.4, 0.4, 0.25]
+      POINT_CLOUD_RANGE: [-140.8, -40.0, -3, 140.8, 40.0, 1]
       VFE:
         NAME: DynamicVoxelVFE
         USE_NORM: True
@@ -403,9 +402,9 @@ model:
       IMAGE_FEATURES: 1
       #TPV配置
       TPV_FEATURES: 1
-      TPV_SIZE: [200, 704, 40]
-      PC_RANGE: [-140.8, -40.0, -70.0, 140.8, 40.0, 10.0]
-      VOXEL_SIZE: [0.4, 0.4, 2.0]
+      TPV_SIZE: [200, 704, 16]
+      PC_RANGE: [-140.8, -40.0, -3, 140.8, 40.0, 1]
+      VOXEL_SIZE: [0.4, 0.4, 0.25]
       #深度估计
       DEPTH_BINS: 80
       DBOUND: [2.0, 50.0, 0.5]
@@ -456,7 +455,7 @@ model:
       NUM_HEADS: 1
       NUM_LAYERS: 3
       K_NEIGHBORS: 16
-      PC_RANGE: [-140.8, -40.0, -70.0, 140.8, 40.0, 10.0]
+      PC_RANGE: [-140.8, -40.0, -3, 140.8, 40.0, 1]
       NUM_POINTS: 5
       NUM_LEARNABLE_PTS: 0
       MAX_DISTANCE: 10.0
@@ -496,12 +495,12 @@ model:
       MAX_NEIGHBORS: 64
       ASSOC_CHUNK: 4096
       AGGREGATION_METHOD: 'mean'
-      Z_BINS: 32
+      Z_BINS: 20
       HEIGHT_EMBED_DIM: 1
       FUSE_MODE: 'add'  # 使用 'add' 以保持输出维度为 FEATURE_DIM=2，避免 concat 增加维度到 3
-      VOXEL_SIZE: [0.25, 0.25, 2]
-      GRID_SIZE: [704, 200, 32]
-      POINT_CLOUD_RANGE: [-140.8, -40.0, -70.0, 140.8, 40.0, 10.0]
+      VOXEL_SIZE: [0.4, 0.4, 0.25]
+      GRID_SIZE: [704, 200, 16]
+      POINT_CLOUD_RANGE: [-140.8, -40.0, -3, 140.8, 40.0, 1]
   core_method: airv2x_gaussian
 name: airv2x_intermediate_gaussian
 num_anchor: 2
@@ -565,4 +564,4 @@ train_params:
 validate_dir: /home/chubin/suyi/dataset/AirV2X-Perception/val/val #use
 test_dir: /home/chubin/suyi/dataset/AirV2X-Perception/test/test #use
 yaml_parser: load_airv2x_params
-
+visualize: True #use

@@ -49,6 +49,7 @@ def train_parser():
                       help="Number of workers for data loading")
     parser.add_argument("--amp", action="store_true",
                       help="Enable automatic mixed precision training")
+    parser.add_argument("--gpu_id",default=0)
     return parser.parse_args()
 
 def setup_dataloader(dataset, hypes, opt, is_train=True):
@@ -149,7 +150,8 @@ def main():
     # Build datasets
     print("Building datasets...")
     # 对于MambaFusion模型，需要启用visualize模式以包含origin_lidar等字段
-    visualize_mode = "mambafusion" in hypes.get("name", "").lower() or "mambafusion" in str(hypes.get("model", {}).get("core_method", ""))
+    visualize_mode = hypes.get("visualize", False)
+   
     train_dataset = build_dataset(hypes, visualize=visualize_mode, train=True)
     val_dataset = build_dataset(hypes, visualize=visualize_mode, train=False)
     
@@ -171,7 +173,12 @@ def main():
     print(f"Total parameters: {total_params:,}")
     
     # Setup device and distributed training
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        gpu_id = int(opt.gpu_id)
+        device = torch.device(f"cuda:{gpu_id}")
+        torch.cuda.set_device(gpu_id)
+    else:
+        device = torch.device("cpu")
     if torch.cuda.is_available():
         model.to(device)
     if opt.distributed:

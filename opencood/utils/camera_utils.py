@@ -34,7 +34,6 @@ def sample_augmentation(data_aug_conf, is_train):
     """
     H, W = data_aug_conf['H'], data_aug_conf['W']
     fH, fW = data_aug_conf['final_dim']
-    is_train = False
     if is_train:
         resize = np.random.uniform(*data_aug_conf['resize_lim'])
         resize_dims = (int(W*resize), int(H*resize))

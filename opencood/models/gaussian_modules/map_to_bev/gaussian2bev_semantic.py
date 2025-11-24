@@ -133,7 +133,7 @@ class ContinuousGaussianVFE(nn.Module):
         rot  = gaussians["rotation"]
         feat = gaussians["features"]
         semantic = gaussians["semantic"]
-        bidx = gaussians.get("batch_idx", torch.zeros(mu.shape[0], device=mu.device, dtype=torch.long))
+        bidx = gaussians.get("batch_idx", torch.zeros(mu.shape[0], device=mu.device, dtype=torch.long)) if len(mu) > 0 else []
         device = bidx.device
         # 1) 连续 → 离散体素索引
         voxel_bzyx, valid = self._discrete_voxel_indices(mu, bidx, device)

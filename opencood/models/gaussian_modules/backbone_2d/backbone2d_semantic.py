@@ -86,12 +86,18 @@ class GaussianImageBackbone(nn.Module):
         Returns:
             dict: 包含TPV特征的输出字典
         """
+        agent_idx = {}
+        count = 0
+        for agent in available_agent:
+            agent_idx[agent] = count
+            count += batch_dict[agent]['record_len'].item()
+            
         # 处理每个Agent的图像数据，分别存储
         self.agent_types = available_agent
         for agent_type in self.agent_types:
             if agent_type in batch_dict and 'batch_merged_cam_inputs' in batch_dict[agent_type]:
                 agent_data = batch_dict[agent_type]
-                
+                camera_num = batch_dict[agent_type]['batch_merged_cam_inputs']['imgs'].shape[1]
                 # 1. 图像特征提取（低分辨率，节省显存）
                 image_features = self.image_backbone(agent_data)  # [B, N, C, 64, 176]
                 B, N = image_features.shape[:2]
@@ -105,10 +111,17 @@ class GaussianImageBackbone(nn.Module):
                 # 3. 获取相机参数（参考 airv2x_encoder.py 的投影方式）
                 cam_inputs = agent_data['batch_merged_cam_inputs']
                 intrinsics = cam_inputs['intrinsics'].view(1,B*N,3,3)  # [B, N, 3, 3]
-                rots = cam_inputs['rots'].view(1,B*N,3,3)  # [B, N, 3, 3] 相机到ego的旋转
-                trans = cam_inputs['trans'].view(1,B*N,3)  # [B, N, 3] 相机到ego的平移
+                rots = cam_inputs['rots'].view(1,B*N,3,3)  # [B, N, 3, 3] 相机到agent本地lidar坐标系的旋转
+                trans = cam_inputs['trans'].view(1,B*N,3)  # [B, N, 3] 相机到agent本地lidar坐标系的平移
                 post_rots = cam_inputs['post_rots'].view(1,B*N,3,3)  # [B, N, 3, 3] 数据增强的旋转
                 post_trans = cam_inputs['post_trans'].view(1,B*N,3)  # [B, N, 3] 数据增强的平移
+                
+                agent_to_ego_transform = batch_dict['img_pairwise_t_matrix_collab'][0,agent_idx[agent_type]:agent_idx[agent_type]+batch_dict[agent_type]['record_len'],0,:,:]
+                # 4. 获取从agent本地坐标系到ego坐标系的变换矩阵
+                # img_pairwise_t_matrix_collab: [B, L, L, 4, 4]
+                # pairwise_t_matrix[0, i, 0, :, :] 表示从agent i到ego(agent 0)的变换
+                agent_to_ego_transform = agent_to_ego_transform.unsqueeze(0)
+                agent_to_ego_transform = agent_to_ego_transform.repeat_interleave(camera_num, dim=1)
                 
                 # 6. TPV投影和高斯生成（仅使用低分辨率 conf_map
                 tpv_results = self.tpv_projector(
@@ -119,7 +132,8 @@ class GaussianImageBackbone(nn.Module):
                     trans=trans,
                     post_rots=post_rots,
                     post_trans=post_trans,
-                    topk_mask=topk_mask
+                    topk_mask=topk_mask,
+                    agent_to_ego_transform=agent_to_ego_transform  # 传递变换矩阵
                 )
                 
                 # 7. 将结果存储到对应agent的batch_dict中
@@ -524,17 +538,18 @@ class OptimizedLSSBasedTPVGeneratorV2(nn.Module):
     # ====================================================
     # 主前向：LSS → TPV → Gaussian
     # ====================================================
-    def forward(self, image_feat, conf_map, intrinsics, rots, trans, post_rots, post_trans, topk_mask=None):
+    def forward(self, image_feat, conf_map, intrinsics, rots, trans, post_rots, post_trans, topk_mask=None, agent_to_ego_transform=None):
         """
         Args:
             image_feat:  [B, N, C, 64, 176]   低分辨率图像特征
             conf_map:    [B, N, M, 64, 176]   Detection head 输出的 softmax 概率
             topk_mask:   [B, N, 64, 176] or None  Top-K 像素 mask（Top-K 且非空类）
             intrinsics:  [B, N, 3, 3]         相机内参
-            rots:        [B, N, 3, 3]         相机到ego坐标系的旋转矩阵
-            trans:       [B, N, 3]            相机到ego坐标系的平移向量
+            rots:        [B, N, 3, 3]         相机到agent本地lidar坐标系的旋转矩阵
+            trans:       [B, N, 3]            相机到agent本地lidar坐标系的平移向量
             post_rots:   [B, N, 3, 3]         数据增强的旋转矩阵（需要undo）
             post_trans:  [B, N, 3]            数据增强的平移向量（需要undo）
+            agent_to_ego_transform: [B, N, 4, 4] or None  从agent本地坐标系到ego坐标系的变换矩阵
         """
         B, N, C, H, W = image_feat.shape
         device = image_feat.device
@@ -544,7 +559,7 @@ class OptimizedLSSBasedTPVGeneratorV2(nn.Module):
 
         # Step 2: LSS 投影 (几何变换) - 按需生成正确的frustum尺寸
         _, _, _, H, W = image_features.shape
-        geom_coords = self._compute_world_coords(intrinsics, rots, trans, post_rots, post_trans, H, W)  # 不会展开 D×H×W
+        geom_coords = self._compute_world_coords(intrinsics, rots, trans, post_rots, post_trans, H, W, agent_to_ego_transform)  # 不会展开 D×H×W
         # Step 3: scatter_add → TPV（使用低分辨率特征）
         tpv = self._build_tpv_from_lss_v2(image_features, depth_prob, geom_coords) #实测优化版 快0.5s
         # Step 4: 高斯生成（全部使用低分辨率，避免上采样）
@@ -568,21 +583,23 @@ class OptimizedLSSBasedTPVGeneratorV2(nn.Module):
     # ====================================================
     # Step 2: 几何坐标计算（参考 airv2x_encoder.py 的 get_geometry 方法）
     # ====================================================
-    def _compute_world_coords(self, intrinsics, rots, trans, post_rots, post_trans, H=None, W=None):
+    def _compute_world_coords(self, intrinsics, rots, trans, post_rots, post_trans, H=None, W=None, agent_to_ego_transform=None):
         """
-        计算图像特征投影到世界坐标系的坐标
+        计算图像特征投影到世界坐标系的坐标（ego坐标系）
         参考 airv2x_encoder.py 的 get_geometry 方法，考虑数据增强的逆变换
+        并应用从agent本地坐标系到ego坐标系的变换
         
         Args:
             intrinsics:  [B, N, 3, 3] 相机内参
-            rots:        [B, N, 3, 3] 相机到ego坐标系的旋转矩阵
-            trans:       [B, N, 3]    相机到ego坐标系的平移向量
+            rots:        [B, N, 3, 3] 相机到agent本地lidar坐标系的旋转矩阵
+            trans:       [B, N, 3]    相机到agent本地lidar坐标系的平移向量
             post_rots:   [B, N, 3, 3] 数据增强的旋转矩阵（需要undo）
             post_trans:  [B, N, 3]    数据增强的平移向量（需要undo）
             H, W:        图像高度和宽度
+            agent_to_ego_transform: [B, N, 4, 4] or None  从agent本地坐标系到ego坐标系的变换矩阵
             
         Returns:
-            world_coords: [B, N, D, H, W, 3] 世界坐标系下的点坐标
+            world_coords: [B, N, D, H, W, 3] ego坐标系下的点坐标
         """
         B, N = intrinsics.shape[:2]
         if H is None or W is None:
@@ -613,14 +630,28 @@ class OptimizedLSSBasedTPVGeneratorV2(nn.Module):
             dim=5,
         )  # [B, N, D, H, W, 3]
 
-        # Step 3: Transform to ego frame (世界坐标系)
+        # Step 3: Transform to agent local lidar frame (agent本地lidar坐标系)
         # 计算 rots @ inv(intrinsics)
         inv_intrins = torch.inverse(intrinsics)
         combine = rots.matmul(inv_intrins)  # [B, N, 3, 3]
         points = combine.view(B, N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1)).squeeze(-1)  # [B, N, D, H, W, 3]
         points = points + trans.view(B, N, 1, 1, 1, 3)  # 加上平移
+        # 此时points在agent本地lidar坐标系中
 
-        return points  # [B, N, D, H, W, 3]
+        # Step 4: Transform to ego frame (如果提供了变换矩阵)
+        # 将agent本地坐标系中的点变换到ego坐标系
+        if agent_to_ego_transform is not None:
+            # agent_to_ego_transform: [B, N, 4, 4]
+            # 提取旋转和平移部分
+            agent_rots = agent_to_ego_transform[:, :, :3, :3]  # [B, N, 3, 3]
+            agent_trans = agent_to_ego_transform[:, :, :3, 3]  # [B, N, 3]
+            # 应用旋转变换
+            points = agent_rots.view(B, N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1)).squeeze(-1)  # [B, N, D, H, W, 3]
+            # 应用平移变换
+            points = points + agent_trans.view(B, N, 1, 1, 1, 3)  # [B, N, D, H, W, 3]
+        # 如果未提供变换矩阵，points仍在agent本地坐标系中（需要后续在agent_fuser中对齐）
+
+        return points  # [B, N, D, H, W, 3] (在ego坐标系中，如果提供了agent_to_ego_transform)
     
     # ====================================================
     # Step 3: scatter_add 生成 TPV (优化版：基于 GPU 的 batched scatter)
@@ -765,6 +796,7 @@ class OptimizedLSSBasedTPVGeneratorV2(nn.Module):
             return pooled_2d.reshape(B, C, plane_shape[0], plane_shape[1])
 
         # Step 4: 三平面聚合
+        
         tpv_xy = scatter_plane(rank_xy, weighted_feats, (Hy, Wx))
         tpv_xz = scatter_plane(rank_xz, weighted_feats, (Wx, Dz))
         tpv_yz = scatter_plane(rank_yz, weighted_feats, (Hy, Dz))
