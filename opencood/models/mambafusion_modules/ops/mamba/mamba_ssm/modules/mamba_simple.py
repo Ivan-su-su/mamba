@@ -35,7 +35,7 @@ except ImportError:
 from timm.models.layers import DropPath
 
 import torch.utils.checkpoint as cp
-
+import torch.distributed as dist
 
 class Mamba(nn.Module):
     def __init__(
@@ -334,14 +334,20 @@ class Block2(nn.Module):
     def forward(self, x):
         if self.post_norm:
             if self.with_cp:
-                x_out = cp.checkpoint(self.mamba, x)
+                if dist.is_available() and dist.is_initialized():
+                    x_out = self.mamba(x)  
+                else:
+                    x_out = cp.checkpoint(self.mamba, x, use_reentrant=False)
                 x = x + self.drop_path(self.norm(x_out))
             else:
                 x = x + self.drop_path(self.norm(self.mamba(x)))
         else:
             if self.with_cp:
                 x = self.norm(x)
-                x_out = cp.checkpoint(self.mamba, x)
+                if dist.is_available() and dist.is_initialized():
+                    x_out = self.mamba(x)   
+                else:
+                    x_out = cp.checkpoint(self.mamba, x, use_reentrant=False)
                 x = x + self.drop_path(x_out)
             else:
                 x = x + self.drop_path(self.mamba(self.norm(x)))

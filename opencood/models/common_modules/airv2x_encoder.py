@@ -221,11 +221,9 @@ class LiftSplatShootEncoder(nn.Module):
 
         # Flatten features
         x = x.reshape(Nprime, C)
-
         # Convert to voxel coordinates
         geom_feats = ((geom_feats - (self.bx - self.dx / 2.0)) / self.dx).long()
         geom_feats = geom_feats.view(Nprime, 3)
-        
         # Create batch indices
         batch_ix = torch.cat(
             [torch.full([Nprime // B, 1], ix, device=x.device, dtype=torch.long)
@@ -242,7 +240,9 @@ class LiftSplatShootEncoder(nn.Module):
             & (geom_feats[:, 2] >= 0)
             & (geom_feats[:, 2] < self.nx[2])
         )
+        import pdb; pdb.set_trace()
         x = x[kept]
+        
         geom_feats = geom_feats[kept]
 
         # Sort by voxel and batch

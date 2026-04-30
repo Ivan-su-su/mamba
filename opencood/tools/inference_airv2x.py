@@ -24,6 +24,12 @@ from opencood.data_utils.datasets import build_dataset
 # from opencood.tools import train_utils as train_utils
 from opencood.tools import inference_utils as inference_utils
 from opencood.tools import train_utils
+from opencood.tools.temporal_utils import (
+    get_temporal_training_cfg,
+    is_mambafusion_model,
+    populate_temporal_fields,
+    update_temporal_state,
+)
 from opencood.visualization import simple_vis
 
 
@@ -85,6 +91,7 @@ def main():
     ]
 
     hypes = yaml_utils.load_yaml(None, opt)
+    temporal_cfg = get_temporal_training_cfg(hypes)
 
     if opt.comm_thre is not None:
         hypes["model"]["args"]["fusion_args"]["communication"]["thre"] = opt.comm_thre
@@ -156,10 +163,22 @@ def main():
 
     total_comm_rates = []
     # total_box = []
+    temporal_state = {}
+    use_temporal_streaming = (
+        temporal_cfg["enable"]
+        and is_mambafusion_model(hypes)
+        and opt.fusion_method in {"early", "intermediate"}
+    )
     for i, batch_data in tqdm(enumerate(data_loader)):
         with torch.no_grad():
             # _batch_data = batch_data[0]
             batch_data = train_utils.to_device(batch_data, device)
+            if use_temporal_streaming:
+                populate_temporal_fields(
+                    batch_data["ego"],
+                    device,
+                    prev_frame=temporal_state.get("prev_frame"),
+                )
             # print(_batch_data.keys())
             # _batch_data = train_utils.to_device(_batch_data, device)
             # if 'scope' in hypes['name'] or 'how2comm' in hypes['name']:
@@ -210,6 +229,8 @@ def main():
                 raise NotImplementedError(
                     "Only early, late and intermediate, no, intermediate_with_comm fusion modes are supported."
                 )
+            if use_temporal_streaming:
+                update_temporal_state(temporal_state, batch_data["ego"])
             if pred_box_tensor is None:
                 continue
 

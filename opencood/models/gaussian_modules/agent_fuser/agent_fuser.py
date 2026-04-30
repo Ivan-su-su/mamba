@@ -255,7 +255,8 @@ class AgentFuser(nn.Module):
                     fused_sum = weighted_features
                 else:
                     fused_sum = fused_sum + weighted_features
-            
+                # Pop各agent的融合TPV特征，保留全局融合的fused_agents_tpv_xy/xz/yz
+                batch_dict[agent_type].pop(plane_key, None)
             if fused_sum is not None:
                 fused_results[plane] = fused_sum
         
@@ -289,6 +290,8 @@ class AgentFuser(nn.Module):
                 all_features.append(features)
                 semantic = merged_gaussians['semantic']
                 all_semantic.append(semantic)
+            # Pop各agent的融合TPV特征，保留全局融合的fused_agents_tpv_xy/xz/yz
+            batch_dict[agent_type].pop('merged_gaussians', None)
         if len(all_mu) > 0:
             all_mu = torch.cat(all_mu, dim=0)
             all_scale = torch.cat(all_scale, dim=0)

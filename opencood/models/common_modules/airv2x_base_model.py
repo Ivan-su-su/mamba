@@ -128,6 +128,7 @@ class Airv2xBase(nn.Module):
         if "vehicle" in self.collaborators and len(data_dict["vehicle"]["batch_idxs"]) > 0:
             assert self.veh_models is not None, "Vehicle model is not initialized."
             output_dict_veh = []
+           
             for v_model in self.veh_models:
                 output_dict_veh.append(v_model(data_dict))
             output_dict_veh = self.fuse_bev(output_dict_veh)

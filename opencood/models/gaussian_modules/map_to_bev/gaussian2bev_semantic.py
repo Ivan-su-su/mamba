@@ -21,6 +21,15 @@ import torch_scatter
 from typing import Dict, Tuple, Optional
 from torch_scatter import scatter_add, scatter_mean, scatter_max
 from typing import List
+import os
+
+# Import visualization module
+try:
+    from .visualization import visualize_gaussian2bev_pipeline
+    VISUALIZATION_AVAILABLE = True
+except ImportError:
+    VISUALIZATION_AVAILABLE = False
+    print("Warning: Visualization module not available")
 
 class ContinuousGaussianVFE(nn.Module):
     """
@@ -558,15 +567,16 @@ class BEVFeatureRefiner(nn.Module):
     简单三层 CNN refine BEV 特征图
     输入输出维度相同，用 ReLU 激活
     """
-    def __init__(self, in_channels: int): #TODO channels 是image 和 semantic concat
+    def __init__(self, in_channels: int, out_channels: int, downsample: int = 2): #TODO channels 是image 和 semantic concat
         super().__init__()
+        self.downsample = downsample
         self.refinement_layers = nn.Sequential(
-            nn.Conv2d(in_channels, 3*in_channels, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels, 3*in_channels, kernel_size=3, padding=1, stride=self.downsample),
             nn.ReLU(inplace=True),
             nn.Conv2d(3*in_channels, 3*in_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(3*in_channels, in_channels, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(3*in_channels, out_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
         )
     def forward(self, bev_features: torch.Tensor) -> torch.Tensor:
         return self.refinement_layers(bev_features)
@@ -618,6 +628,10 @@ class GaussianToBEV(nn.Module):
         self.z_bins = model_cfg.get('Z_BINS', 32)
         self.height_embed_dim = model_cfg.get('HEIGHT_EMBED_DIM', 128)
         self.fuse_mode = model_cfg.get('FUSE_MODE', 'concat')
+        self.downsample = model_cfg.get('DOWNSAMPLE', 2)
+        # 默认保存路径：当前文件所在目录下的 visualizations 文件夹
+        default_vis_dir = os.path.join(os.path.dirname(__file__), 'visualizations')
+        self.visualization_save_dir = model_cfg.get('VISUALIZATION_SAVE_DIR', default_vis_dir)
 
         # ---------------- 1) 连续体素聚合 (你给的 ContinuousGaussianVFE) ----------------
         self.vfe = ContinuousGaussianVFE(
@@ -661,33 +675,15 @@ class GaussianToBEV(nn.Module):
         )
 
         # 计算 Refiner 输入通道（concat 会增加通道）
-        bev_in_channels = self.feature_dim if self.fuse_mode == 'add' else (self.feature_dim + self.height_embed_dim)
+        bev_in_channels = self.feature_dim if self.fuse_mode == 'add' else (self.feature_dim + self.height_embed_dim) #TODO feature_dim 应该+4 因为semantic是4维
 
         # ---------------- 5) 轻量 CNN refine（可选） ----------------
         if self.use_refinement:
             # 如果指定了 OUTPUT_FEATURE_DIM，refiner 输出应该匹配它
             # 否则 refiner 输入输出维度相同
-            if self.output_feature_dim != bev_in_channels:
-                # 需要添加一个投影层来调整维度
-                from torch.nn import Sequential, Conv2d, ReLU
-                self.refiner = Sequential(
-                    BEVFeatureRefiner(in_channels=bev_in_channels),
-                    Conv2d(bev_in_channels, self.output_feature_dim, kernel_size=1),
-                    ReLU(inplace=True)
-                )
-            else:
-                # 你的简版 Refiner（in==out）
-                self.refiner = BEVFeatureRefiner(in_channels=(bev_in_channels+4))
+            self.refiner = BEVFeatureRefiner(in_channels=(bev_in_channels+4),out_channels=self.output_feature_dim, downsample=self.downsample)
         else:
-            # 即使不使用 refiner，如果维度不匹配也需要投影
-            if bev_in_channels != self.output_feature_dim:
-                from torch.nn import Sequential, Conv2d, ReLU
-                self.refiner = Sequential(
-                    Conv2d(bev_in_channels, self.output_feature_dim, kernel_size=1),
-                    ReLU(inplace=True)
-                )
-            else:
-                self.refiner = None
+            self.refiner = None
 
     @torch.no_grad()
     def _voxel_centers_from_coords(self, voxel_coords: torch.Tensor) -> torch.Tensor:
@@ -709,11 +705,31 @@ class GaussianToBEV(nn.Module):
             bev_features: [B, C_out, H, W]
             intermediates: Dict
         """
+        import time
+        start_time = time.time()
         gaussians = batch_dict['fused_agents_gaussians']    
 
         # 1) 连续 VFE：按 voxel 聚合（返回连续中心 + 整数 voxel_coords）
         pooled_gaussians, voxel_coords = self.vfe(gaussians)
+        
+        # 可视化 1.可视化之前的fused_agents_gaussians 2.可视化之后的pooled_gaussians 3.可视化voxel_coords
 
+        # try:
+        #     visualize_gaussian2bev_pipeline(
+        #         fused_gaussians=gaussians,
+        #         pooled_gaussians=pooled_gaussians,
+        #         voxel_coords=voxel_coords,
+        #         save_dir=self.visualization_save_dir,
+        #         point_cloud_range=tuple(self.point_cloud_range),
+        #         voxel_size=tuple(self.voxel_size),
+        #         max_points=10000,
+        #         max_voxels=50000
+        #     )
+        # except Exception as e:
+        #     print(f"Warning: Visualization failed: {e}")
+        
+        print('pooled_gaussians:', len(pooled_gaussians['mu']))
+        print('gaussians:', len(gaussians['mu']))
         # 2) 邻居关系（可选）
         neighbor_info = None
         if self.neighbor_associator is not None:
@@ -746,6 +762,15 @@ class GaussianToBEV(nn.Module):
             bev_features = self.refiner(bev_features)
     
         batch_dict['spatial_features_2d'] = bev_features
+        end_time = time.time()
+        print(f"GaussianToBEV time: {end_time - start_time} seconds")
+        import pdb; pdb.set_trace()
+        # 释放高斯参数和TPV特征以节省显存（已生成spatial_features_2d，不再需要）
+        batch_dict.pop('fused_agents_gaussians', None)
+        batch_dict.pop('fused_agents_tpv_xy', None)
+        batch_dict.pop('fused_agents_tpv_xz', None)
+        batch_dict.pop('fused_agents_tpv_yz', None)
+        
         return batch_dict
 
 # =============================================================

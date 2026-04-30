@@ -355,7 +355,7 @@ def setup_train(hypes):
     current_path = os.path.dirname(__file__)
     current_path = os.path.join(current_path, "../logs")
 
-    full_path = os.path.join(current_path, model_name, tag + "_" + time_name)
+    full_path = os.path.join(current_path, model_name, tag + time_name)
 
     if not os.path.exists(full_path):
         if not os.path.exists(full_path):

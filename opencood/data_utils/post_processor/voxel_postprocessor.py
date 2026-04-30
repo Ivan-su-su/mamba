@@ -408,6 +408,7 @@ class VoxelPostprocessor(BasePostprocessor):
         neg_equal_one = []
         targets = []
         class_ids = []
+        anchor_box_list = []
 
         for i in range(len(label_batch_list)):
             # print(label_batch_list[i].keys())
@@ -415,6 +416,9 @@ class VoxelPostprocessor(BasePostprocessor):
             neg_equal_one.append(label_batch_list[i]["neg_equal_one"])
             targets.append(label_batch_list[i]["targets"])
             class_ids.append(label_batch_list[i]["cls_labels"])
+            # Add anchor_box if available
+            if "anchor_box" in label_batch_list[i]:
+                anchor_box_list.append(label_batch_list[i]["anchor_box"])
 
         pos_equal_one = torch.from_numpy(np.array(pos_equal_one))
         neg_equal_one = torch.from_numpy(np.array(neg_equal_one))
@@ -422,12 +426,19 @@ class VoxelPostprocessor(BasePostprocessor):
 
         class_ids = torch.from_numpy(np.array(class_ids))
 
-        return {
+        result = {
             "targets": targets,
             "pos_equal_one": pos_equal_one,
             "neg_equal_one": neg_equal_one,
             "class_ids": class_ids,
         }
+        
+        # Add anchor_box if available (for IoU loss)
+        if len(anchor_box_list) > 0:
+            anchor_box = torch.from_numpy(np.array(anchor_box_list[0]))  # Use first one (same for all)
+            result["anchor_box"] = anchor_box
+
+        return result
 
     def post_process(self, data_dict, output_dict):
         """
@@ -692,6 +703,8 @@ class VoxelPostprocessor(BasePostprocessor):
         gt_box3d_tensor : torch.Tensor
             The groundtruth bounding box tensor.
         """
+        import time
+        total_start = time.time()
         pred_box3d_list = []
         pred_box2d_list = []
         pred_label_list = []
@@ -699,6 +712,8 @@ class VoxelPostprocessor(BasePostprocessor):
 
         C = self.num_class # num of classes
         Nanchor = self.anchor_num  # number of anchor per location
+        
+        cav_process_start = time.time()
         for cav_id, cav_content in data_dict.items():
             assert cav_id in output_dict
             transformation_matrix = cav_content["transformation_matrix"]
@@ -729,12 +744,41 @@ class VoxelPostprocessor(BasePostprocessor):
             class_labels = class_labels + 1
 
             # Apply score threshold and ignore background class (0)
-            # score_thresh = self.params["target_args"]["score_threshold"]
-            
             obj_thresh = self.params["target_args"]["obj_threshold"]
-            # print(f"obj: {objectness}, score: {class_scores}")
-            # non_bg_mask = class_labels == 3
+            score_thresh = self.params["target_args"].get("score_threshold", 0.2)
+            
+            # 对齐where2comm：同时使用objectness和class_scores进行过滤
+            # 这样可以更有效地过滤掉低质量候选框
             mask = (objectness > obj_thresh)
+            
+            # 打印详细的统计信息以便调试退化解
+            total_candidates = objectness.shape[1]
+            obj_filtered = (objectness > obj_thresh).sum().item()
+            score_filtered = (class_scores > score_thresh).sum().item()
+            final_filtered = mask.sum().item()
+            
+            # 计算统计信息
+            obj_mean = objectness.mean().item()
+            obj_max = objectness.max().item()
+            obj_min = objectness.min().item()
+            score_mean = class_scores.mean().item()
+            score_max = class_scores.max().item()
+            score_min = class_scores.min().item()
+            
+            if total_candidates > 1000:  # 只打印大量候选框的情况
+                print(f"[post_process_airv2x] 过滤统计: 总候选={total_candidates}, "
+                      f"objectness过滤后={obj_filtered}, class_scores过滤后={score_filtered}, "
+                      f"最终过滤后={final_filtered}")
+                print(f"  | objectness: mean={obj_mean:.4f}, max={obj_max:.4f}, min={obj_min:.4f}, thresh={obj_thresh:.4f}")
+                print(f"  | class_scores: mean={score_mean:.4f}, max={score_max:.4f}, min={score_min:.4f}, thresh={score_thresh:.4f}")
+                
+                # 检查是否可能是退化解
+                if obj_mean < 0.01 and score_mean < 0.01:
+                    print(f"  | ⚠️ 警告: objectness和class_scores都很低，可能是退化解（全背景预测）")
+                elif obj_filtered > 0 and final_filtered == 0:
+                    print(f"  | ⚠️ 警告: objectness通过但class_scores不通过，可能是分类头有问题")
+                elif final_filtered == 0 and total_candidates > 1000:
+                    print(f"  | ⚠️ 警告: 大量候选框但全部被过滤，可能是阈值设置过高或模型输出异常")
 
             if mask.sum() == 0:
                 continue
@@ -755,6 +799,7 @@ class VoxelPostprocessor(BasePostprocessor):
 
             # Project boxes to ego space
             if len(boxes3d) > 0:
+                project_start = time.time()
                 boxes3d_corner = box_utils.boxes_to_corners_3d(
                     boxes3d, order=self.params["order"]
                 )
@@ -767,11 +812,17 @@ class VoxelPostprocessor(BasePostprocessor):
                 boxes2d_score = torch.cat(
                     (projected_boxes2d, scores3d.unsqueeze(1)), dim=1
                 )
+                project_end = time.time()
+                if len(boxes3d) > 1000:  # 只打印大量框的情况
+                    print(f"[post_process_airv2x] {cav_id} 坐标转换时间 ({len(boxes3d)} boxes): {project_end - project_start:.4f} 秒")
 
                 pred_box2d_list.append(boxes2d_score)
                 pred_box3d_list.append(projected_boxes3d)
                 pred_label_list.append(labels3d)
                 boxes3d_list.append(boxes3d)
+        
+        cav_process_end = time.time()
+        print(f"[post_process_airv2x] CAV处理循环时间: {cav_process_end - cav_process_start:.4f} 秒")
 
             # # convert output to bounding box
             # if len(boxes3d) != 0:
@@ -802,13 +853,17 @@ class VoxelPostprocessor(BasePostprocessor):
             return None, None, None, None
 
         # Concatenate results across CAVs
+        concat_start = time.time()
         pred_box2d_tensor = torch.vstack(pred_box2d_list)
         scores = pred_box2d_tensor[:, -1]
         pred_box3d_tensor = torch.vstack(pred_box3d_list)
         labels = torch.cat(pred_label_list)
         boxes3d = torch.cat(boxes3d_list)
+        concat_end = time.time()
+        print(f"[post_process_airv2x] 拼接结果时间 (boxes: {len(pred_box3d_tensor)}): {concat_end - concat_start:.4f} 秒")
 
         # Post-filtering: large boxes, abnormal Z, etc.
+        filter_start = time.time()
         keep_index_1 = box_utils.remove_large_pred_bbx(pred_box3d_tensor, self.dataset)
         
         z_min = self.lidar_range[2]
@@ -821,8 +876,12 @@ class VoxelPostprocessor(BasePostprocessor):
         scores = scores[keep_index]
         labels = labels[keep_index]
         boxes3d = boxes3d[keep_index]
+        filter_end = time.time()
+        print(f"[post_process_airv2x] 预过滤时间 (剩余: {len(pred_box3d_tensor)} boxes): {filter_end - filter_start:.4f} 秒")
 
         # Rotated NMS
+        nms_start = time.time()
+        nms_input_count = len(pred_box3d_tensor)
         keep_index = box_utils.nms_rotated(
             pred_box3d_tensor, scores, self.params["nms_thresh"]
         )
@@ -830,8 +889,12 @@ class VoxelPostprocessor(BasePostprocessor):
         scores = scores[keep_index]
         labels = labels[keep_index]
         boxes3d = boxes3d[keep_index]
+        nms_end = time.time()
+        nms_output_count = len(pred_box3d_tensor)
+        print(f"[post_process_airv2x] NMS时间 (输入: {nms_input_count}, 输出: {nms_output_count}): {nms_end - nms_start:.4f} 秒")
 
         # Filter by range
+        range_filter_start = time.time()
         mask = box_utils.get_mask_for_boxes_within_range_torch(
             pred_box3d_tensor, self.lidar_range
         )
@@ -839,6 +902,11 @@ class VoxelPostprocessor(BasePostprocessor):
         scores = scores[mask]
         labels = labels[mask]
         boxes3d = boxes3d[mask]
+        range_filter_end = time.time()
+        print(f"[post_process_airv2x] 范围过滤时间 (剩余: {len(pred_box3d_tensor)} boxes): {range_filter_end - range_filter_start:.4f} 秒")
+
+        total_end = time.time()
+        print(f"[post_process_airv2x] 总时间: {total_end - total_start:.4f} 秒")
 
         assert scores.shape[0] == pred_box3d_tensor.shape[0] == labels.shape[0]
         return pred_box3d_tensor, scores, labels, boxes3d

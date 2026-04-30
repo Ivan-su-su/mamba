@@ -124,12 +124,14 @@ class Airv2xWhere2com(Airv2xBase):
         batch_dict = self.backbone(batch_output_dict)
         # N, C, H', W'. [N, 256, 50, 176]
         batch_spatial_features_2d = batch_dict["spatial_features_2d"]
+        print(f"[Where2comm] Backbone输出特征图尺寸: {batch_spatial_features_2d.shape}")
         # camera features are still in its own coordinate system
         pairwise_t_matrix = data_dict["img_pairwise_t_matrix_collab"]
 
         # downsample feature to reduce memory
         if self.shrink_flag:
             batch_spatial_features_2d = self.shrink_conv(batch_spatial_features_2d)
+            print(f"[Where2comm] Shrink后特征图尺寸: {batch_spatial_features_2d.shape}")
             
         
             
@@ -167,11 +169,13 @@ class Airv2xWhere2com(Airv2xBase):
 
             psm = self.cls_head(fused_feature)
             rm = self.reg_head(fused_feature)
+            print(f"[Where2comm] 检测头输出尺寸: psm={psm.shape}, rm={rm.shape}")
 
             output_dict.update({"psm": psm, "rm": rm})
 
             if self.args["obj_head"]:
                 obj = self.obj_head(fused_feature)
+                print(f"[Where2comm] obj_head输出尺寸: obj={obj.shape}")
                 output_dict.update({"obj": obj})
 
             output_dict.update(

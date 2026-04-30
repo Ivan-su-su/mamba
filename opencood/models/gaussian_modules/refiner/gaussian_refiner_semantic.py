@@ -8,9 +8,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple, Optional, List
-import faiss
-import numpy as np
 import math
+import time
+
+# 尝试导入 FAISS GPU（可选，如果可用则使用）
+try:
+    import faiss
+    FAISS_AVAILABLE = True
+except ImportError:
+    FAISS_AVAILABLE = False
 
 
 class GaussianPrediction:
@@ -86,7 +92,7 @@ class GaussianTPVRefiner(nn.Module):
             img_feature_dim=self.feature_dim,
             lidar_feature_dim=self.feature_dim,
             output_dim=self.embed_dims,
-            pc_range=pc_range,
+            pc_range=self.pc_range,
             num_learnable_pts=self.num_learnable_pts
         )
         
@@ -134,7 +140,8 @@ class GaussianTPVRefiner(nn.Module):
     def forward(
         self,
         batch_dict: Dict,
-        available_agents: List[str]
+        available_agents: List[str],
+        fused_iter:bool=False
     ) -> Dict[str, torch.Tensor]:
         """
         前向传播
@@ -169,7 +176,7 @@ class GaussianTPVRefiner(nn.Module):
         updated_gaussians : Dict
             更新后的高斯点，包含 'mu', 'scale', 'rotation', 'features'
         """
-        if getattr(batch_dict,'fused_agents_gaussians', None) is not None:
+        if batch_dict.get('fused_agents_gaussians', None) is not None:
             merged_gaussians = batch_dict['fused_agents_gaussians']
             tpv_value, spatial_shapes, level_start_index = self.tpv_flattener(
                 tpv_xy=batch_dict['fused_agents_tpv_xy'],
@@ -180,7 +187,9 @@ class GaussianTPVRefiner(nn.Module):
                         merged_gaussians=merged_gaussians,
                         tpv_spatial_shapes=spatial_shapes  # 传入spatial_shapes进行归一化
                     )
-            batch_dict['fused_agents_gaussians'] = self.gaussian_update(merged_gaussians, spatial_shapes, tpv_value, level_start_index)       
+            batch_dict['fused_agents_gaussians'] = self.gaussian_update(merged_gaussians, spatial_shapes, tpv_value, level_start_index) 
+            print('refine down for one iter for fused_agents_gaussians')
+            print('merged_fused_gaussians:', len(batch_dict['fused_agents_gaussians']['mu']))
         else:
             for agent in available_agents:
                 tpv_value, spatial_shapes, level_start_index = self.tpv_flattener(
@@ -188,13 +197,15 @@ class GaussianTPVRefiner(nn.Module):
                     tpv_xz=batch_dict[agent]['fused_tpv_xz'],
                     tpv_yz=batch_dict[agent]['fused_tpv_yz']
                 )  # tpv_value: [B, sum(H_l*W_l), tpv_feature_dim], spatial_shapes: [3, 2]
-                if getattr(batch_dict[agent],'merged_gaussians', None) is not None:
+                if batch_dict[agent].get('merged_gaussians', None) is not None:
+                    print('use merged_gaussians')
                     merged_gaussians = batch_dict[agent]['merged_gaussians']
                     merged_gaussians = self.gaussian_aggregator(
                         merged_gaussians=merged_gaussians,
                         tpv_spatial_shapes=spatial_shapes  # 传入spatial_shapes进行归一化
                     )  # Dict: 'mu', 'scale', 'rotation', 'features', 'ref_xy', 'ref_xz', 'ref_yz' (已归一化)
                 else:
+                    print('use image_gaussians and lidar_gaussians')
                     img_gaussians = batch_dict[agent]['image_gaussians']
                     lidar_gaussians = batch_dict[agent]['lidar_gaussians']     
                     merged_gaussians = self.gaussian_aggregator(
@@ -203,6 +214,10 @@ class GaussianTPVRefiner(nn.Module):
                         tpv_spatial_shapes=spatial_shapes  # 传入spatial_shapes进行归一化
                     )
                 batch_dict[agent]['merged_gaussians'] = self.gaussian_update(merged_gaussians, spatial_shapes, tpv_value, level_start_index)
+                batch_dict[agent].pop('image_gaussians', None)
+                batch_dict[agent].pop('lidar_gaussians', None)
+                print('refine down for one iter for agent:', agent)
+                print('merged_gaussians:', len(batch_dict[agent]['merged_gaussians']['mu']))
         return batch_dict
     def gaussian_update(self, merged_gaussians, spatial_shapes, tpv_value, level_start_index):
         # TPV特征投影到embed_dims维度
@@ -269,6 +284,8 @@ class GaussianAggregator(nn.Module):
         # self.lidar_align = nn.Linear(lidar_feature_dim, output_dim) if lidar_feature_dim != output_dim else nn.Identity() TODO temporarily
         self.lidar_align = nn.Linear(2, output_dim) if lidar_feature_dim != output_dim else nn.Identity()
         self.output_dim = output_dim
+        if torch.is_tensor(pc_range):
+            pc_range = pc_range.clone().detach()
         self.register_buffer("pc_range", torch.tensor(pc_range, dtype=torch.float32))
         self.num_learnable_pts = int(num_learnable_pts)
         self.learnable_fc = nn.Linear(output_dim, self.num_learnable_pts * 3) if self.num_learnable_pts > 0 else None
@@ -731,13 +748,25 @@ class SparseGaussianSelfAttention(nn.Module):
         self.output_proj = nn.Linear(embed_dims, embed_dims)
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(embed_dims)
+
+    def _run_faiss_knn(self, means: torch.Tensor, max_k: int):
+        means_np = means.detach().float().cpu().numpy().astype("float32")
+        res = faiss.StandardGpuResources()
+        gpu_id = torch.cuda.current_device()
+        cpu_index = faiss.IndexFlatL2(3)
+        gpu_index = faiss.index_cpu_to_gpu(res, gpu_id, cpu_index)
+        gpu_index.add(means_np)
+        distances_sq, indices = gpu_index.search(means_np, max_k)  # 返回平方距离
+        knn_indices = torch.from_numpy(indices).to(means.device).long()
+        distances = torch.from_numpy(distances_sq).to(means.device).sqrt()
+        return knn_indices, distances
         
     def build_knn_graph(self, means: torch.Tensor):
         """
-        构建 k-NN 图（使用FAISS），带距离限制
+        构建 k-NN 图，优先使用 FAISS GPU；不可用时退回 PyTorch 实现
         
         Args:
-            means: [N, 3] 高斯中心
+            means: [N, 3] 高斯中心（期望在 GPU 上）
         
         Returns:
             knn_indices: [N, max_k] 邻居索引（包含自身，有效邻居数量可能不同）
@@ -746,30 +775,56 @@ class SparseGaussianSelfAttention(nn.Module):
         N = means.shape[0]
         max_k = min(self.k_neighbors + 1, N)  # +1 包含自身
         
-        # 转换为numpy用于FAISS
-        means_np = means.cpu().detach().numpy().astype('float32')
+        # =========================================
+        # 方案1：FAISS GPU（可选，避免手动构建距离矩阵）
+        # =========================================
+        use_faiss_gpu = (
+            FAISS_AVAILABLE
+            and torch.cuda.is_available()
+            and means.is_cuda
+            and N >= 10000  # 小规模用 PyTorch 更方便
+        )
+        if use_faiss_gpu:
+            try:
+                start_time = time.time()
+                knn_indices, distances = self._run_faiss_knn(means, max_k)
+                torch.cuda.synchronize()
+                end_time = time.time()
+                
+                valid_mask = (distances <= self.max_distance) | (distances < 1e-6)
+                valid_mask[:, 0] = True
+                all_false = ~valid_mask.any(dim=1)
+                valid_mask[all_false, 0] = True
+                print(f"FAISS GPU knn time: {end_time - start_time} seconds")
+                return knn_indices, valid_mask
+            except Exception as e:
+                # 如果 FAISS GPU 失败，回退到 PyTorch 实现
+                print(f"[Warning] FAISS GPU knn failed ({e}), fallback to torch.cdist.")
         
-        # 构建FAISS索引
-        index = faiss.IndexFlatL2(3)
-        index.add(means_np)
+        # =========================================
+        # 方案2：PyTorch GPU（cdist + topk）
+        # =========================================
+        if N <= 50000:
+            dist_matrix = torch.cdist(means, means, p=2)  # [N, N]
+            distances, knn_indices = torch.topk(dist_matrix, max_k, dim=1, largest=False)
+        else:
+            batch_size = 10000
+            knn_indices_list = []
+            distances_list = []
+            for i in range(0, N, batch_size):
+                end_idx = min(i + batch_size, N)
+                query_points = means[i:end_idx]
+                dist_batch = torch.cdist(query_points, means, p=2)  # [batch, N]
+                dist_k, idx_k = torch.topk(dist_batch, max_k, dim=1, largest=False)
+                knn_indices_list.append(idx_k)
+                distances_list.append(dist_k)
+            knn_indices = torch.cat(knn_indices_list, dim=0)
+            distances = torch.cat(distances_list, dim=0)
         
-        # 搜索 k 个邻居
-        distances, indices = index.search(means_np, max_k)
-        
-        # 转换为tensor - force long dtype for indices
-        knn_indices = torch.from_numpy(indices).to(means.device).long()  # [N, k]
-        distances_tensor = torch.from_numpy(distances).to(means.device)  # [N, k]
-        
-        # 距离过滤：只保留在max_distance内的邻居（排除自身点距离为0的情况）
-        valid_mask = (distances_tensor <= self.max_distance ** 2) | (distances_tensor < 1e-6)
-        
-        # 确保第一个邻居（通常是自身）总是有效的
+        valid_mask = (distances <= self.max_distance) | (distances < 1e-6)
         valid_mask[:, 0] = True
-        
-        # 对于完全无效的行，强制第一个邻居有效
-        all_false = ~valid_mask.any(dim=1)  # [N]
+        all_false = ~valid_mask.any(dim=1)
         valid_mask[all_false, 0] = True
-        
         return knn_indices, valid_mask
     
     def gather_neighbors(self, x: torch.Tensor, knn_idx: torch.Tensor) -> torch.Tensor:
@@ -1249,10 +1304,16 @@ class GaussianDecoder(nn.Module):
         
         # 参数范围
         if pc_range is not None:
+            if torch.is_tensor(pc_range):
+                pc_range = pc_range.clone().detach()
             self.register_buffer("pc_range", torch.tensor(pc_range, dtype=torch.float32))
         else:
             self.register_buffer("pc_range", None)
-            
+        
+        if torch.is_tensor(scale_range):
+            scale_range = scale_range.clone().detach()
+        if torch.is_tensor(unit_xyz):
+            unit_xyz = unit_xyz.clone().detach()
         self.register_buffer("scale_range", torch.tensor(scale_range, dtype=torch.float32))
         self.register_buffer("unit_xyz", torch.tensor(unit_xyz, dtype=torch.float32))
         
@@ -1290,9 +1351,20 @@ class GaussianDecoder(nn.Module):
         semantic = gs_params[..., 10:14]  # [N, 4]
         
         # 2. 计算 ∆means: 增量更新位置
-        # delta_xyz 通过 sigmoid 映射到 [-unit_xyz, unit_xyz]
         delta_xyz = (2 * safe_sigmoid(delta_xyz) - 1.0) * self.unit_xyz[None, :]
-        original_gaussian['mu'] = original_gaussian['mu'] + delta_xyz  # [N, 3] 直接更新
+        mu = original_gaussian['mu'] + delta_xyz  # [N, 3]
+
+        # 确保更新后的位置在 point_cloud_range 范围内
+        # pc_range 格式: [x_min, y_min, z_min, x_max, y_max, z_max]
+        if self.pc_range is not None:
+            pc_min = self.pc_range[:3]   # [3]
+            pc_max = self.pc_range[3:]   # [3]
+            # torch.clamp 支持 tensor 作为 min/max，会按 [3] 广播到 [N,3]
+            mu = torch.clamp(mu, min=pc_min, max=pc_max)
+
+        # 最后一次性写回字典（非 in-place 修改 Tensor 本身）
+        original_gaussian['mu'] = mu
+
         
         # 3. 计算新scales: 增量更新
         # scale_params 作为增量，通过 tanh 限制范围后加到原始 scales

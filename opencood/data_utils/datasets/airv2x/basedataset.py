@@ -203,6 +203,20 @@ class BaseDataset(Dataset):
                     break
             i += 1
 
+        # 图片语义真值配置
+        # 从模型配置中读取（如果存在）
+        backbone_2d_cfg = params.get("model", {}).get("args", {}).get("BACKBONE_2D", {})
+        self.load_image_semantic_gt = backbone_2d_cfg.get("LOAD_IMAGE_SEMANTIC_GT", False)
+        self.semantic_map = np.array([
+            0,   # background
+            1,   # bicycle -> bicycle
+            2,   # motorcycle    -> motorcycle
+            4,   # van -> van
+            6,   # bus -> bus
+            5,   # truck -> truck
+            3,   # car -> car
+        ], dtype=np.int8)
+
     def __len__(self):
         return self.len_record[-1]
 
@@ -274,6 +288,8 @@ class BaseDataset(Dataset):
             data[cav_id]["cameras"] = load_camera_data(
                 cav_content[timestamp_key_delay]["cameras"]
             )
+            # 保存相机文件路径（用于后续加载语义真值）
+            data[cav_id]["camera_paths"] = cav_content[timestamp_key_delay]["cameras"]
             
             data[cav_id]["depth"] = load_camera_data(
                 cav_content[timestamp_key_delay]["depth"]
@@ -527,6 +543,8 @@ class BaseDataset(Dataset):
         return delay_params
 
     def shuffle_ego(self):
+        temporal_cfg = self.params.get("temporal_training", {})
+        fixed_temporal_ego = bool(temporal_cfg.get("enable", False))
         for scenario_idx, scenario_dict in self.scenario_database.items():
             # collect vehicles that could be ego
             ego_type_idx = []
@@ -534,7 +552,7 @@ class BaseDataset(Dataset):
                 agent_dict["ego"] = False
                 if next(iter(agent_dict.items()))[1]["agent_type"] == self.ego_type:
                     ego_type_idx.append(agent_idx)
-            if self.train:
+            if self.train and not fixed_temporal_ego:
                 # random choose one vehicle as ego
                 ego_idx = random.choice(ego_type_idx)
                 self.scenario_database[scenario_idx][ego_idx]["ego"] = True
@@ -932,6 +950,45 @@ class BaseDataset(Dataset):
         # img = Image.fromarray(color_image)
         # img.save('dummy_images/label_map_color.png')
         return label_map
+
+    def _load_image_semantic_gt(self, camera_file_path):
+        """
+        从 .bin 文件加载图片的语义分割真值
+        
+        Args:
+            camera_file_path: 相机图片的文件路径 (例如: .../front_camera.png)
+        
+        Returns:
+            semantic_gt: [H, W] numpy array, 语义标签图 (dtype=uint8)
+                        如果文件不存在，返回 None
+        """
+        # 将图片路径转换为对应的 .bin 文件路径
+        # 例如: .../front_camera.png -> .../front_seg.bin
+        base_path = os.path.splitext(camera_file_path)[0]  # 去掉扩展名: .../front_camera
+        # 去掉 "_camera" 后缀（如果存在）
+        if base_path.endswith("_camera"):
+            base_path = base_path[:-7]  # 移除 "_camera" (7个字符)
+        seg_bin_path = base_path + "_seg.bin"
+        
+        if not os.path.exists(seg_bin_path):
+            # print(f"[Warning] Semantic GT file not found: {seg_bin_path}")
+            return None
+        
+        try:
+            # 读取 .bin 文件（格式：uint8，720x1280）
+            semantic_gt = np.fromfile(seg_bin_path, dtype=np.uint8)
+            # 重塑为图像尺寸（720x1280）
+            semantic_gt = semantic_gt.reshape(720, 1280)
+            # 仅支持 0~6 作为 semantic_map 下标，大于 6 的原始值视为无效，映射为背景 0
+            # if semantic_gt.max() >= len(self.semantic_map):
+            #     invalid = semantic_gt >= len(self.semantic_map)
+            #     semantic_gt = semantic_gt.copy()
+            #     semantic_gt[invalid] = 0
+            semantic_gt = self.semantic_map[semantic_gt]
+            return semantic_gt
+        except Exception as e:
+            print(f"[Error] Failed to load semantic GT from {seg_bin_path}: {e}")
+            return None
 
 
 if __name__ == "__main__":

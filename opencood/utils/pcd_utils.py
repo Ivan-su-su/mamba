@@ -64,7 +64,7 @@ def pcd_to_np(pcd_file, get_weather=False, correct_coordinate_system=False):
     pcd = o3d.io.read_point_cloud(pcd_file)
 
     xyz = np.asarray(pcd.points)
-    # we save the intensity in the first channel
+    # we save the intensity in the last channel
     intensity = np.expand_dims(np.asarray(pcd.colors)[:, 0], -1)
     pcd_np = np.hstack((xyz, intensity))
     pcd_np = np.asarray(pcd_np, dtype=np.float32)

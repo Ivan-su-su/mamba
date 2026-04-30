@@ -21,6 +21,7 @@ from more_itertools import unique_everseen
 import matplotlib
 import numpy as np
 import torch
+import torch.nn.functional as F
 import cv2
 from collections import defaultdict
 
@@ -110,6 +111,7 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         self.veh_data_aug_conf = params["fusion"]["args"]["veh_data_aug_conf"]
         self.rsu_data_aug_conf = params["fusion"]["args"]["rsu_data_aug_conf"]
         self.drone_data_aug_conf = params["fusion"]["args"]["drone_data_aug_conf"]
+        self.weather_aug_conf = params["fusion"]["args"].get("weather_aug_conf")
         
         self.training = train
 
@@ -120,6 +122,14 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
             if "cur_ego_pose_flag" not in params["fusion"]["args"]
             else params["fusion"]["args"]["cur_ego_pose_flag"]
         )
+        self.temporal_training_cfg = params.get("temporal_training", {})
+        self.temporal_training_enable = bool(
+            self.temporal_training_cfg.get("enable", False)
+        )
+        self.temporal_training_mode = str(
+            self.temporal_training_cfg.get("mode", "streaming")
+        ).lower()
+        self._shared_camera_aug_cache = None
 
         self.pre_processor = build_preprocessor(params["preprocess"], train)
         self.post_processor = post_processor.build_postprocessor(
@@ -134,24 +144,76 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
             self.agent_order = ["drone", "vehicle", "rsu"]
         # for mambafusion
         if params['model']['core_method'] == 'airv2x_mambafusion':
+            # TODO: 这些不知道写这有啥用
             self.point_cloud_range = np.array(params['POINT_CLOUD_RANGE'], dtype=np.float32)
             self.point_feature_encoder = PointFeatureEncoder(
                 params['POINT_FEATURE_ENCODING'],
                 point_cloud_range=self.point_cloud_range
             )
-            self.grid_size = np.array([704,200,32])  # 根据VOXEL_SIZE计算得出
-            self.voxel_size =  (self.point_cloud_range[3:6] - self.point_cloud_range[0:3])/ self.grid_size 
+            self.grid_size = np.array(params['GRID_SIZE'], dtype=np.float32)
+            self.voxel_size =  (self.point_cloud_range[3:6] - self.point_cloud_range[0:3])/ self.grid_size
             self.depth_downsample_factor = None
             # self.class_names =  ['car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier', 'motorcycle']
             self.class_names = ['car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier', 'motorcycle']
     
+    def _resolve_index(self, idx):
+        """Return scenario and local timestamp metadata for a global index."""
+        scenario_index = 0
+        for i, ele in enumerate(self.len_record):
+            if idx < ele:
+                scenario_index = i
+                break
+        timestamp_index = (
+            idx if scenario_index == 0 else idx - self.len_record[scenario_index - 1]
+        )
+        scenario_database = self.scenario_database[scenario_index]
+        timestamp_key = self.return_timestamp_key(scenario_database, timestamp_index)
+        return scenario_index, timestamp_index, timestamp_key
+
     def __getitem__(self, idx):
+        if (
+            self.train
+            and self.temporal_training_enable
+            and self.temporal_training_mode == "queue"
+        ):
+            return self._get_temporal_queue_item(idx)
+        return self._get_single_item(idx)
+
+    def _get_temporal_queue_item(self, idx):
+        """Build a two-frame queue with shared camera geometric augmentation."""
+        scenario_index, timestamp_index, _ = self._resolve_index(idx)
+        prev_idx = idx - 1 if timestamp_index > 0 else idx
+        prev_valid = timestamp_index > 0
+
+        if prev_valid:
+            prev_scenario_index, _, _ = self._resolve_index(prev_idx)
+            prev_valid = prev_scenario_index == scenario_index
+        else:
+            prev_scenario_index = scenario_index
+
+        self._shared_camera_aug_cache = {}
+        try:
+            prev_item = self._get_single_item(prev_idx if prev_valid else idx)
+            cur_item = self._get_single_item(idx)
+        finally:
+            self._shared_camera_aug_cache = None
+
+        return {
+            "temporal_queue": [prev_item, cur_item],
+            "temporal_prev_valid": prev_valid,
+            "temporal_prev_scenario_index": prev_scenario_index,
+            "temporal_cur_scenario_index": scenario_index,
+        }
+
+    def _get_single_item(self, idx):
         # Default order if none specified
         agent_order = self.agent_order
+        scenario_index_meta, timestamp_index, _ = self._resolve_index(idx)
         
         base_data_dict, scenario_index, timestamp_key = self.retrieve_base_data(
             idx, cur_ego_pos_flag=self.cur_ego_pose_flag
         )
+        assert scenario_index == scenario_index_meta
         processed_data_dict = OrderedDict()
         processed_data_dict["ego"] = {}
 
@@ -206,6 +268,9 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         dynamic_seg_label = None
         static_seg_label = None
         metadata_path = None
+        weather_state = camera_utils.sample_weather_augmentation(
+            self.weather_aug_conf, self.train
+        )
 
         too_far = []
 
@@ -220,7 +285,7 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
                 continue
                 
             selected_cav_processed, img_process_info= self.get_item_single_car(
-                selected_cav_base, ego_lidar_pose
+                selected_cav_base, ego_lidar_pose, weather_state
             )
             # Add data to the appropriate agent collection
             current_agent = agent_data[agent_type]
@@ -375,6 +440,8 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
             mask=mask,
             class_ids_padded=class_ids_padded,
         )
+        # Add anchor_box to label_dict for IoU loss
+        label_dict["anchor_box"] = anchor_box
         
         assert dynamic_seg_label is not None, "seg_label should not be None"
         assert static_seg_label is not None, "seg_label should not be None"
@@ -400,6 +467,8 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
             "time_delay": all_time_delay,
             "infra": all_infra,
             "scenario_index": scenario_index,
+            "sample_index": idx,
+            "timestamp_index": timestamp_index,
             "timestamp_key": timestamp_key,
             "metadata_path": metadata_path,
             "ego_lidar_pose": ego_lidar_pose,
@@ -464,7 +533,18 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         pts_valid_flag = np.logical_and(depth > 0, val_flag_merge)
         return lidar[pts_valid_flag]
 
-    def get_item_single_car(self, selected_cav_base, ego_pose):
+    def _sample_camera_augmentation(self, agent_type, camera_idx, data_aug_conf):
+        """Sample or reuse camera geometry augmentation for temporal queues."""
+        cache = self._shared_camera_aug_cache
+        if cache is None:
+            return camera_utils.sample_augmentation(data_aug_conf, self.train)
+
+        key = (agent_type, int(camera_idx))
+        if key not in cache:
+            cache[key] = camera_utils.sample_augmentation(data_aug_conf, self.train)
+        return cache[key]
+
+    def get_item_single_car(self, selected_cav_base, ego_pose, weather_state=None):
         """
         Project the lidar and bbx to ego space first, and then do clipping.
 
@@ -500,16 +580,19 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         
         camera_data_list = selected_cav_base["cameras"]
         depth_data_list = selected_cav_base.get("depth", [])
+        camera_paths_list = selected_cav_base.get("camera_paths", [])  # 相机文件路径
         params = selected_cav_base["params"]
 
         N = len(camera_data_list)
         camera_to_lidar_matrix = params["delay_extrinsic"].reshape(N, 4, 4)
         camera_intrinsics = params["delay_intrinsic"].reshape(N, 3, 3)
-
+        # import pdb; pdb.set_trace()
         post_trans = torch.zeros(N, 3, dtype=torch.float32)
         post_rots = torch.eye(3, dtype=torch.float32).unsqueeze(0).repeat(N, 1, 1)
 
         imgs = []
+        original_imgs = []  # 保存原始图像（未经过变换）
+        image_semantic_gts = []  # 保存图片语义真值（如果启用）
         rots = []
         trans = []
         intrins = []
@@ -519,6 +602,18 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         img_process_info = []
 
         for idx, img in enumerate(camera_data_list):
+            # 保存原始图像（在处理之前）
+            # 将PIL Image转换为tensor: [C, H, W]，值范围[0, 1]
+            import torchvision.transforms as transforms
+            to_tensor = transforms.ToTensor()
+            original_img_tensor = to_tensor(img)  # [3, H, W]，值范围[0, 1]
+            original_imgs.append(original_img_tensor)
+
+            # 加载图片语义真值（如果启用）
+            semantic_gt = None
+            if self.load_image_semantic_gt and len(camera_paths_list) > idx:
+                camera_path = camera_paths_list[idx]
+                semantic_gt = self._load_image_semantic_gt(camera_path)  # [720, 1280]
             camera_to_lidar = camera_to_lidar_matrix[idx]
             camera_to_lidar = camera_utils.ue4_to_lss(camera_to_lidar)
             camera_intrinsic = camera_intrinsics[idx]
@@ -536,16 +631,16 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
                 
             
             if agent_type == "vehicle":
-                resize, resize_dims, crop, flip, rotate = camera_utils.sample_augmentation(
-                    self.veh_data_aug_conf, self.train
+                resize, resize_dims, crop, flip, rotate = self._sample_camera_augmentation(
+                    agent_type, idx, self.veh_data_aug_conf
                 )
             elif agent_type == "rsu":
-                resize, resize_dims, crop, flip, rotate = camera_utils.sample_augmentation(
-                    self.rsu_data_aug_conf, self.train
+                resize, resize_dims, crop, flip, rotate = self._sample_camera_augmentation(
+                    agent_type, idx, self.rsu_data_aug_conf
                 )
             elif agent_type == "drone":
-                resize, resize_dims, crop, flip, rotate = camera_utils.sample_augmentation(
-                    self.drone_data_aug_conf, self.train
+                resize, resize_dims, crop, flip, rotate = self._sample_camera_augmentation(
+                    agent_type, idx, self.drone_data_aug_conf
                 )
             img_src, post_rot2, post_tran2 = camera_utils.img_transform(
                 img_src,
@@ -557,7 +652,38 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
                 flip=flip,
                 rotate=rotate,
             )
-            
+            img_src[0] = camera_utils.apply_weather_augmentation(
+                img_src[0],
+                weather_state,
+                depth_image=img_src[1] if depth_data_list else None,
+            )
+
+            # 对语义真值应用相同的数据增强
+            if semantic_gt is not None:
+                # 将 numpy array 转换为 PIL Image
+                from PIL import Image as PILImage
+                semantic_gt_pil = PILImage.fromarray(semantic_gt)
+                # 使用 NEAREST 插值，避免 resize/rotate 产生 0~6 之外的类别（如 7）
+                semantic_gt_transformed, _, _ = camera_utils.img_transform(
+                    [semantic_gt_pil],
+                    torch.eye(2),
+                    torch.zeros(2),
+                    resize=resize,
+                    resize_dims=resize_dims,
+                    crop=crop,
+                    flip=flip,
+                    rotate=rotate,
+                    resample=PILImage.NEAREST,
+                )
+                # 转换回 numpy array，形状 [H, W]
+                semantic_gt_final = np.array(semantic_gt_transformed[0], dtype=np.uint8)
+                image_semantic_gts.append(torch.from_numpy(semantic_gt_final).long())
+            else:
+                # 如果没有语义真值，添加一个空tensor占位
+                # 使用增强后的图像尺寸
+                if len(img_src) > 0:
+                    h, w = img_src[0].size[::-1]
+                    image_semantic_gts.append(torch.zeros(h, w, dtype=torch.long))
             
             post_tran = torch.zeros(3)
             post_rot = torch.eye(3)
@@ -578,20 +704,22 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
             post_trans.append(post_tran)
             img_process_info.append([resize,crop,False,0])
             
-        selected_cav_processed.update(
-            {
-            "cam_inputs": 
-                {
-                    "imgs": torch.stack(imgs), # [Ncam, 3or4, H, W]
-                    "intrinsics": torch.stack(intrins),
-                    "extrinsics": torch.stack(extrinsics),
-                    "rots": torch.stack(rots),
-                    "trans": torch.stack(trans),
-                    "post_rots": torch.stack(post_rots),
-                    "post_trans": torch.stack(post_trans),
-                }
-            }
-        )
+        cam_inputs_dict = {
+            "imgs": torch.stack(imgs), # [Ncam, 3or4, H, W]
+            "intrinsics": torch.stack(intrins),
+            "extrinsics": torch.stack(extrinsics),
+            "rots": torch.stack(rots),
+            "trans": torch.stack(trans),
+            "post_rots": torch.stack(post_rots),
+            "post_trans": torch.stack(post_trans),
+            "original_imgs": torch.stack(original_imgs),  # [Ncam, 3, H_orig, W_orig] 原始图像（未经过变换）
+        }
+        
+        # 如果加载了图片语义真值，添加到字典中
+        if self.load_image_semantic_gt and len(image_semantic_gts) > 0:
+            cam_inputs_dict["image_semantic_gts"] = torch.stack(image_semantic_gts)  # [Ncam, H, W]
+        
+        selected_cav_processed.update({"cam_inputs": cam_inputs_dict})
         
         # if agent_type == "drone":
         #     lidar_np = []
@@ -601,16 +729,33 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         lidar_np = shuffle_points(lidar_np)
         lidar_np = mask_ego_points(lidar_np)
         # project the lidar to ego space
+        # if agent_type == "drone":
+        #     print("lidar_np before project: ", lidar_np.shape)
+        #     print("lidar_np[:, 0].max(): ", lidar_np[:, 0].max())
+        #     print("lidar_np[:, 0].min(): ", lidar_np[:, 0].min())
+        #     print("lidar_np[:, 1].max(): ", lidar_np[:, 1].max())
+        #     print("lidar_np[:, 1].min(): ", lidar_np[:, 1].min())
+        #     print("lidar_np[:, 2].max(): ", lidar_np[:, 2].max())
+        #     print("lidar_np[:, 2].min(): ", lidar_np[:, 2].min())
         if self.proj_first:
             lidar_np[:, :3] = box_utils.project_points_by_matrix_torch(
                 lidar_np[:, :3], transformation_matrix
             )
+        # print("lidar_np after project: ", lidar_np.shape)
+        # print("lidar_np[:, 0].max(): ", lidar_np[:, 0].max())
+        # print("lidar_np[:, 0].min(): ", lidar_np[:, 0].min())
+        # print("lidar_np[:, 1].max(): ", lidar_np[:, 1].max())
+        # print("lidar_np[:, 1].min(): ", lidar_np[:, 1].min())
+        # print("lidar_np[:, 2].max(): ", lidar_np[:, 2].max())
+        # print("lidar_np[:, 2].min(): ", lidar_np[:, 2].min())
+
         lidar_np = mask_points_by_range(
             lidar_np, self.params["preprocess"]["cav_lidar_range"]
         )
         
         # Note: Here we handle the case of empty lidar points (mostly due to system error).
         # No supervision under such case.
+        # print("lidar_np after mask: ", lidar_np.shape)
         if len(lidar_np) == 0:
             object_bbx_mask = np.zeros_like(object_bbx_mask)
        
@@ -627,7 +772,109 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         )
         return selected_cav_processed,img_process_info #for mambafusion
 
+
+    def _build_instance_voxel_mask(self, instance_lidar_list, instance_batch_indices):
+        """
+        Build the same instance-wise voxel mask as DynamicVoxelVFE, but in the dataloader.
+
+        Returns
+        -------
+        tuple[Optional[torch.Tensor], Optional[torch.Tensor]]
+            instance_voxel_mask: [num_instances, num_voxels] bool
+            instance_valid_mask: [num_instances] bool
+        """
+        if (
+            not hasattr(self, "point_cloud_range")
+            or not hasattr(self, "voxel_size")
+            or not hasattr(self, "grid_size")
+        ):
+            return None, None
+
+        if not isinstance(instance_lidar_list, list) or len(instance_lidar_list) == 0:
+            return None, None
+
+        pc_range = np.asarray(self.point_cloud_range, dtype=np.float32)
+        voxel_size = np.asarray(self.voxel_size, dtype=np.float32)
+        grid_size = np.asarray(self.grid_size, dtype=np.int64)
+        # TODO: 这里应该优化，与dynamic_voxel_vfe.py保持对齐，由于batch_idx全0，可以简化
+        scale_xyz = int(grid_size[0] * grid_size[1] * grid_size[2])
+        scale_yz = int(grid_size[1] * grid_size[2])
+        scale_z = int(grid_size[2])
+        
+        all_merge_coords = []
+        per_instance_merge_coords = []
+        for instance_idx, raw_points in enumerate(instance_lidar_list):
+            if raw_points is None:
+                per_instance_merge_coords.append(np.zeros((0,), dtype=np.int64))
+                continue
+
+            points_np = np.asarray(raw_points, dtype=np.float32)
+            if points_np.ndim == 3 and points_np.shape[0] == 1:
+                points_np = points_np.squeeze(0)
+            if points_np.size == 0 or points_np.ndim != 2 or points_np.shape[1] < 3:
+                per_instance_merge_coords.append(np.zeros((0,), dtype=np.int64))
+                continue
+
+            points_coords = np.floor(
+                (points_np[:, :3] - pc_range[:3]) / voxel_size[:3]
+            ).astype(np.int64)
+            valid_mask = np.all(
+                (points_coords >= 0) & (points_coords < grid_size[:3]), axis=1
+            )
+            points_coords = points_coords[valid_mask]
+            if points_coords.shape[0] == 0:
+                per_instance_merge_coords.append(np.zeros((0,), dtype=np.int64))
+                continue
+
+            batch_idx = int(instance_batch_indices[instance_idx])
+            merge_coords = (
+                batch_idx * scale_xyz
+                + points_coords[:, 0] * scale_yz
+                + points_coords[:, 1] * scale_z
+                + points_coords[:, 2]
+            ).astype(np.int64)
+            per_instance_merge_coords.append(merge_coords)
+            all_merge_coords.append(merge_coords)
+
+        if len(all_merge_coords) == 0:
+            empty_mask = torch.zeros((len(instance_lidar_list), 0), dtype=torch.bool)
+            empty_valid_mask = torch.zeros((len(instance_lidar_list),), dtype=torch.bool)
+            return empty_mask, empty_valid_mask
+
+        unq_coords = np.unique(np.concatenate(all_merge_coords, axis=0))
+        merge_to_voxel = {int(coord): idx for idx, coord in enumerate(unq_coords.tolist())}
+        instance_voxel_mask = torch.zeros(
+            (len(instance_lidar_list), len(unq_coords)), dtype=torch.bool
+        )
+        for instance_idx, merge_coords in enumerate(per_instance_merge_coords):
+            if merge_coords.shape[0] == 0:
+                continue
+            voxel_indices = [merge_to_voxel[int(coord)] for coord in np.unique(merge_coords)]
+            instance_voxel_mask[instance_idx, torch.as_tensor(voxel_indices, dtype=torch.long)] = True
+
+        instance_valid_mask = instance_voxel_mask.any(dim=1)
+        return instance_voxel_mask, instance_valid_mask
+
+
     def collate_batch_train(self, batch):
+        if batch and isinstance(batch[0], dict) and "temporal_queue" in batch[0]:
+            queue_length = len(batch[0]["temporal_queue"])
+            temporal_queue = []
+            for queue_idx in range(queue_length):
+                frame_batch = [
+                    sample["temporal_queue"][queue_idx] for sample in batch
+                ]
+                temporal_queue.append(self.collate_batch_train(frame_batch)["ego"])
+            return {
+                "ego": {
+                    "temporal_queue": temporal_queue,
+                    "temporal_prev_valid": [
+                        bool(sample.get("temporal_prev_valid", False))
+                        for sample in batch
+                    ],
+                }
+            }
+
         # Intermediate fusion is different the other two
         output_dict = {"ego": {}}
 
@@ -661,6 +908,8 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         cam_inputs_veh_list = []
         merged_cam_inputs_dict_veh_list = []
         batch_idxs_veh = []
+        instance_lidar_veh_list = []
+        instance_batch_indices_veh = []
 
         # rsu
         processed_lidar_features_rsu_lists = []
@@ -668,6 +917,8 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         cam_inputs_rsu_list = []
         merged_cam_inputs_dict_rsu_list = []
         batch_idxs_rsu = []
+        instance_lidar_rsu_list = []
+        instance_batch_indices_rsu = []
 
         # drone
         processed_lidar_features_drone_lists = []
@@ -675,6 +926,8 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         cam_inputs_drone_list = []
         merged_cam_inputs_dict_drone_list = []
         batch_idxs_drone = []
+        instance_lidar_drone_list = []
+        instance_batch_indices_drone = []
 
         # vis
         origin_lidar_veh_list = []
@@ -686,6 +939,8 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         timestamp_key_list = []
         metadata_path_list = []
         ego_lidar_pose_list = []
+        sample_index_list = []
+        timestamp_index_list = []
 
         for i in range(len(batch)):
             ego_dict = batch[i]["ego"]
@@ -724,6 +979,8 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
                     ego_dict["merged_cam_inputs_dict_veh"]
                 )
                 batch_idxs_veh.append(i)
+                instance_lidar_veh_list.extend(ego_dict["original_lidar_vis_veh_list"])
+                instance_batch_indices_veh.extend([i] * ego_dict["num_veh"])
                 
             # rsu
             if ego_dict["num_rsu"] > 0:
@@ -738,6 +995,8 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
                     ego_dict["merged_cam_inputs_dict_rsu"]
                 )
                 batch_idxs_rsu.append(i)
+                instance_lidar_rsu_list.extend(ego_dict["original_lidar_vis_rsu_list"])
+                instance_batch_indices_rsu.extend([i] * ego_dict["num_rsu"])
                 
             # drone
             if ego_dict["num_drone"] > 0:
@@ -752,6 +1011,8 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
                     ego_dict["merged_cam_inputs_dict_drone"]
                 )
                 batch_idxs_drone.append(i)
+                instance_lidar_drone_list.extend(ego_dict["original_lidar_vis_drone_list"])
+                instance_batch_indices_drone.extend([i] * ego_dict["num_drone"])
 
             # vis
             origin_lidar_veh_list.append(ego_dict["origin_lidar_veh"])
@@ -760,12 +1021,15 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
             
             # metadata
             scenario_index_list.append(ego_dict["scenario_index"])
+            sample_index_list.append(ego_dict["sample_index"])
+            timestamp_index_list.append(ego_dict["timestamp_index"])
             timestamp_key_list.append(ego_dict["timestamp_key"])
             metadata_path_list.append(ego_dict["metadata_path"])
             ego_lidar_pose_list.append(ego_dict["ego_lidar_pose"])
 
         dynamic_seg_label_torch = torch.from_numpy(np.array(dynamic_seg_label_list))
         static_seg_label_torch = torch.from_numpy(np.array(static_seg_label_list))
+
         # convert to numpy, (B, max_num, 7)
         object_bbx_center = torch.from_numpy(np.array(object_bbx_center))
         object_bbx_mask = torch.from_numpy(np.array(object_bbx_mask))
@@ -773,6 +1037,7 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         batch_merged_lidar_features_veh = self.merge_features_to_dict(
             merged_lidar_features_dict_veh_list, None, "lidar"
         )
+        # TODO
         batch_merged_cam_inputs_veh = self.merge_features_to_dict(
             merged_cam_inputs_dict_veh_list, "cat", "cam"
         )
@@ -811,6 +1076,16 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
             self.pre_processor.collate_batch(batch_merged_lidar_features_drone)
             if len(merged_lidar_features_dict_drone_list) > 0
             else None
+        )
+
+        instance_voxel_mask_veh, instance_valid_mask_veh = self._build_instance_voxel_mask(
+            instance_lidar_veh_list, instance_batch_indices_veh
+        )
+        instance_voxel_mask_rsu, instance_valid_mask_rsu = self._build_instance_voxel_mask(
+            instance_lidar_rsu_list, instance_batch_indices_rsu
+        )
+        instance_voxel_mask_drone, instance_valid_mask_drone = self._build_instance_voxel_mask(
+            instance_lidar_drone_list, instance_batch_indices_drone
         )
 
         label_dict_torch = self.post_processor.collate_batch_airv2x(label_dict_list)
@@ -857,20 +1132,28 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
                     "batch_merged_cam_inputs": batch_merged_cam_inputs_veh,
                     "record_len": record_len_veh,
                     "batch_idxs": batch_idxs_veh,  # len as record_len and each corresponding to the idx in the batch
+                    "instance_voxel_mask": instance_voxel_mask_veh,
+                    "instance_valid_mask": instance_valid_mask_veh,
                 },
                 "rsu": {
                     "batch_merged_lidar_features_torch": batch_merged_lidar_features_rsu_torch,
                     "batch_merged_cam_inputs": batch_merged_cam_inputs_rsu,
                     "record_len": record_len_rsu,
                     "batch_idxs": batch_idxs_rsu,
+                    "instance_voxel_mask": instance_voxel_mask_rsu,
+                    "instance_valid_mask": instance_valid_mask_rsu,
                 },
                 "drone": {
                     "batch_merged_lidar_features_torch": batch_merged_lidar_features_drone_torch,
                     "batch_merged_cam_inputs": batch_merged_cam_inputs_drone,
                     "record_len": record_len_drone,
                     "batch_idxs": batch_idxs_drone,
+                    "instance_voxel_mask": instance_voxel_mask_drone,
+                    "instance_valid_mask": instance_valid_mask_drone,
                 },
                 "scenario_index_list": scenario_index_list,
+                "sample_index_list": sample_index_list,
+                "timestamp_index_list": timestamp_index_list,
                 "timestamp_key_list": timestamp_key_list,
                 "metadata_path_list": metadata_path_list,
                 "ego_lidar_pose_list": ego_lidar_pose_list,
@@ -938,11 +1221,22 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         gt_box_tensor : torch.Tensor
             The tensor of gt bounding box.
         """
+        import time
+        # 测量预测后处理时间
+        pred_start = time.time()
         pred_box_tensor, pred_score, pred_labels, pred_boxes3d = (
             self.post_processor.post_process_airv2x(data_dict, output_dict)
         )
+        pred_end = time.time()
+        print(f"[post_process] 预测后处理(post_process_airv2x)时间: {pred_end - pred_start:.4f} 秒")
+        
+        # 测量GT生成时间
+        gt_start = time.time()
         gt_box_tensor, gt_class_label_list, gt_track_list = self.post_processor.generate_gt_bbx_airv2x(data_dict)
-        gt_box_tensor, gt_class_label_list, gt_track_list = self.post_processor.generate_gt_bbx_airv2x(data_dict)
+        gt_end = time.time()
+        print(f"[post_process] GT生成(generate_gt_bbx_airv2x)时间: {gt_end - gt_start:.4f} 秒")
+        # 修复：删除了重复的调用
+        # gt_box_tensor, gt_class_label_list, gt_track_list = self.post_processor.generate_gt_bbx_airv2x(data_dict)
 
         return pred_box_tensor, pred_score, pred_labels, pred_boxes3d, gt_box_tensor, gt_class_label_list, gt_track_list
     

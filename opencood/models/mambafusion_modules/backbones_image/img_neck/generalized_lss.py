@@ -80,33 +80,6 @@ class GeneralizedLSSFPN(nn.Module):
         agent_keys = [k for k, v in batch_dict.items() if isinstance(v, dict) and ('image_features' in v)]
         if len(agent_keys) == 0:
             raise KeyError('No image_features found in batch_dict or any agent sub-dicts')
-        
-        # 过滤掉无效的agent（图像特征为空或全零）
-        valid_agent_keys = []
-        for agent_name in agent_keys:
-            agent_dict = batch_dict[agent_name]
-            if 'image_features' in agent_dict:
-                image_features = agent_dict['image_features']
-                # 检查图像特征是否有效
-                is_valid = True
-                if isinstance(image_features, (list, tuple)):
-                    for feat in image_features:
-                        if feat is None or feat.numel() == 0 or torch.count_nonzero(feat).item() == 0:
-                            is_valid = False
-                            break
-                else:
-                    if image_features is None or image_features.numel() == 0 or torch.count_nonzero(image_features).item() == 0:
-                        is_valid = False
-                
-                if is_valid:
-                    valid_agent_keys.append(agent_name)
-                else:
-                    print(f"[GeneralizedLSS] 跳过无效的{agent_name} agent图像特征")
-        
-        if len(valid_agent_keys) == 0:
-            raise KeyError('No valid image_features found in any agent sub-dicts')
-        
-        agent_keys = valid_agent_keys
 
         do_interact = getattr(self.model_cfg, 'AGENT_INTERACT', False)
         # Ensure all agents have same number of pyramid levels

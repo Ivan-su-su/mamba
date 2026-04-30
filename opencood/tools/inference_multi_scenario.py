@@ -26,11 +26,18 @@ from tqdm import tqdm
 
 # Add project root to python path
 root_path = Path(__file__).resolve().parents[2]
-sys.path.append(str(root_path))
+# Prefer the current checkout over any editable install left in the environment.
+sys.path.insert(0, str(root_path))
 
 import opencood.hypes_yaml.yaml_utils as yaml_utils
 from opencood.data_utils.datasets import build_dataset
 from opencood.tools import inference_utils, train_utils
+from opencood.tools.temporal_utils import (
+    get_temporal_training_cfg,
+    is_mambafusion_model,
+    populate_temporal_fields,
+    update_temporal_state,
+)
 from opencood.visualization import simple_vis
 
 # Constants
@@ -188,8 +195,6 @@ def process_batch(
     Returns:
         Tuple of prediction tensors and metrics
     """
-    batch_data = train_utils.to_device(batch_data, device)
-    
     if fusion_method == "late":
         pred_box_tensor, pred_score, gt_box_tensor, output_dict = \
             inference_utils.inference_late_fusion(batch_data, model, dataset)
@@ -286,6 +291,7 @@ def main():
     
     # Load config and setup
     hypes = yaml_utils.load_yaml(None, opt)
+    temporal_cfg = get_temporal_training_cfg(hypes)
     # 指定使用特定的GPU设备
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{opt.gpu_id}")
@@ -343,8 +349,16 @@ def main():
     }
     result_stat_dict = defaultdict(result_stat_init)
     total_comm_rates = []
+    temporal_state: Dict = {}
+    use_temporal_streaming = (
+        temporal_cfg["enable"]
+        and is_mambafusion_model(hypes)
+        and opt.fusion_method in {"early", "intermediate"}
+    )
+    print(f"Temporal streaming enabled: {use_temporal_streaming}")
 
     # Main inference loop
+    import time
     for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader)):
         # Extract timestamp from metadata
         timestamp_match = re.search(
@@ -363,9 +377,20 @@ def main():
         
         result_stat = result_stat_dict[timestamp]
         with torch.no_grad():
+            start_time = time.time()
+            batch_data = train_utils.to_device(batch_data, device)
+            if use_temporal_streaming:
+                populate_temporal_fields(
+                    batch_data["ego"],
+                    device,
+                    prev_frame=temporal_state.get("prev_frame"),
+                )
             # Process batch based on fusion method
             outputs = process_batch(batch_data, model, dataset, opt.fusion_method, device)
-            
+            if use_temporal_streaming:
+                update_temporal_state(temporal_state, batch_data["ego"])
+            end_time = time.time()
+            print(f"forward Time taken: {end_time - start_time} seconds")
             if opt.fusion_method == "intermediate_with_comm":
                 (pred_box_tensor, pred_score, gt_box_tensor, 
                  comm_rates, mask, each_mask) = outputs
@@ -416,6 +441,8 @@ def main():
                     i,
                     left_hand
                 )
+        end_time = time.time()
+        print(f"one_epoch Time taken: {end_time - start_time} seconds")
         print("-------------finish_one_epoch-------------------")
 
     # Calculate final metrics

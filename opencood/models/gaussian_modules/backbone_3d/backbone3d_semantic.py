@@ -14,6 +14,13 @@ import torch_scatter
 
 from ..vfe.vfe_template import VFETemplate
 from ..vfe.dynamic_voxel_vfe import PFNLayerV2
+from opencood.utils.seg_label_utils import (
+    SegLabelMapper, 
+    create_seg_label_mapper_from_config
+)
+import matplotlib.pyplot as plt
+import numpy as np
+from pathlib import Path
 
 
 class DynamicVoxelVFE(VFETemplate):
@@ -27,15 +34,15 @@ class DynamicVoxelVFE(VFETemplate):
     def __init__(self, model_cfg, num_point_features, voxel_size, grid_size, point_cloud_range, **kwargs):
         super().__init__(model_cfg=model_cfg)
         self.model_cfg = model_cfg
-        self.use_norm = self.model_cfg.get('USE_NORM', True)
-        self.with_distance = self.model_cfg.get('WITH_DISTANCE', False)
-        self.use_absolute_xyz = self.model_cfg.get('USE_ABSLOTE_XYZ', True)
-        self.return_abs_coords = self.model_cfg.get('RETURN_ABS_COORDS', False)
+        self.use_norm = self.model_cfg.get('USE_NORM')
+        self.with_distance = self.model_cfg.get('WITH_DISTANCE')
+        self.use_absolute_xyz = self.model_cfg.get('USE_ABSOLUTE_XYZ')
+        self.return_abs_coords = self.model_cfg.get('RETURN_ABS_COORDS')
         num_point_features += 6 if self.use_absolute_xyz else 3
         if self.with_distance:
             num_point_features += 1
 
-        self.num_filters = self.model_cfg.get('NUM_FILTERS', [128, 128])
+        self.num_filters = self.model_cfg.get('NUM_FILTERS')
         assert len(self.num_filters) > 0
         num_filters = [num_point_features] + list(self.num_filters)
 
@@ -71,7 +78,7 @@ class DynamicVoxelVFE(VFETemplate):
         if points is None:
             raise KeyError(f"Could not find 'origin_lidar' or 'origin_lidar_{agent}' in batch_dict")
         
-       # 检查点云是否为空
+        # 检查点云是否为空
         if len(points.shape) == 3 and points.shape[0] == 1:
             # 去掉batch维度：[1, N, 4] -> [N, 4]
             points = points.squeeze(0)
@@ -96,7 +103,7 @@ class DynamicVoxelVFE(VFETemplate):
             # 点高度的原始相对高度（未取整）
         
         points_coords = torch.floor((points[:, [0,1,2]] - point_cloud_range[[0,1,2]]) / voxel_size[[0,1,2]]).int()
-        mask = ((points_coords >= 0) & (points_coords < grid_size[[0,1,2]])).all(dim=1)
+        mask = ((points_coords >= 0) & (points_coords < grid_size[[1,0,2]])).all(dim=1)
         
         # 应用mask到ori_coords_height
         if self.return_abs_coords:
@@ -107,7 +114,7 @@ class DynamicVoxelVFE(VFETemplate):
         points_xyz = points[:, [0,1,2]].contiguous()
 
         # 在运行时计算scale值 dwb 为什么不写在init里？
-        scale_yz = grid_size[1] * grid_size[2]
+        scale_yz = grid_size[0] * grid_size[2]
         scale_z = grid_size[2]
         
         merge_coords = points_coords[:, 0] * scale_yz + \
@@ -156,21 +163,20 @@ class DynamicVoxelVFE(VFETemplate):
 
         for pfn in self.pfn_layers:
             features = pfn(features, unq_inv)
-            # 最终输出体素的特征，(num_voxel,128)
-
+            # 最终输出体素的特征，(num_valid_voxel,128)
         # generate voxel coordinates
         unq_coords = unq_coords.int()
         voxel_coords = torch.stack((unq_coords // scale_yz,
                                     (unq_coords % scale_yz) // scale_z,
                                     unq_coords % scale_z), dim=1)
         # 将之前的合并索引解码回三元组索引并重排为[z, y, x]的格式，(num_voxel,3)
-        voxel_coords = voxel_coords[:, [2, 1, 0]] #TODO
+        voxel_coords = voxel_coords[:, [2, 1, 0]]
         # 增加一个batch_idx维度，因为SparseConvTensor需要batch_idx维度 (num_voxel,4)
-        # TODO
         voxel_coords = torch.cat([torch.zeros(voxel_coords.shape[0], 1, device=voxel_coords.device).int(), voxel_coords], dim=1)
         
         batch_dict[agent]['pillar_features'] = batch_dict[agent]['voxel_features'] = features
         batch_dict[agent]['voxel_coords'] = voxel_coords
+        batch_dict[agent]['voxel_num_points'] = unq_cnt.int()
         
         return batch_dict
 
@@ -204,20 +210,34 @@ class GaussianBackbone3D(nn.Module):
         self.point_cloud_range = point_cloud_range
 
         # 配置参数
-        self.num_features = model_cfg.get('NUM_FEATURES', 64)
-        self.hidden_dim = model_cfg.get('HIDDEN_DIM', 128)
-        self.max_gaussian_ratio = model_cfg.get('MAX_GAUSSIAN_RATIO', 0.05)
-        self.projection_method = model_cfg.get('PROJECTION_METHOD', 'scatter_mean')
-        self.use_gumbel = model_cfg.get('USE_GUMBEL', False)  # 训练时使用Gumbel
-        self.gumbel_temperature = model_cfg.get('GUMBEL_TEMPERATURE', 0.1)
+        self.num_features = model_cfg.get('NUM_FEATURES')
+        self.hidden_dim = model_cfg.get('HIDDEN_DIM')
+        self.max_gaussian_ratio = model_cfg.get('MAX_GAUSSIAN_RATIO')
+        self.projection_method = model_cfg.get('PROJECTION_METHOD')
+        self.use_gumbel = model_cfg.get('USE_GUMBEL')  # 训练时使用Gumbel
+        self.gumbel_temperature = model_cfg.get('GUMBEL_TEMPERATURE')
         # grid_size: [H, W, Z]
         self.tpv_xy_size = [grid_size[0], grid_size[1]]  # [H, W]
         self.tpv_xz_size = [grid_size[1], grid_size[2]]  # [W, Z]
         self.tpv_yz_size = [grid_size[0], grid_size[2]]  # [H, Z]
         
         # 语义分类配置
-        self.num_classes = model_cfg.get('NUM_CLASSES', 4)  # 0类为背景，1..(m-1)为前景
+        self.num_classes = model_cfg.get('NUM_CLASSES')  # 0类为背景，1..(m-1)为前景
         assert self.num_classes > 1, "NUM_CLASSES must be > 1 (0 for background, >=1 for foreground)."
+        self.use_static_supervision = model_cfg.get('USE_STATIC_LABEL', False)
+        self.important_voxel_ratio = float(model_cfg.get('IMPORTANT_VOXEL_RATIO', 1.0))
+        self.important_voxel_ratio = max(0.0, min(1.0, self.important_voxel_ratio))
+        
+        # 初始化语义标签映射器（用于从真实世界坐标查询标签）
+        # 从model_cfg中获取seg_hw和seg_res，如果不存在则使用默认值
+        seg_hw = model_cfg.get('seg_hw', 512)
+        seg_res = model_cfg.get('seg_res', 0.25)
+        self.seg_label_mapper = SegLabelMapper(
+            seg_hw=seg_hw,
+            seg_res=seg_res,
+            lidar_range=point_cloud_range,
+            ego_center=True  # 假设标签图以ego为中心
+        )
         
         # Scale 范围配置（与 GaussianFusion 保持一致）
         self.scale_range = model_cfg.get('SCALE_RANGE', [0.01, 3.2])
@@ -289,7 +309,7 @@ class GaussianBackbone3D(nn.Module):
             voxel_coords = batch_dict['voxel_coords']
 
         device = voxel_features.device
-        
+
         # self.grid_size: [H, W, Z] = [y, x, z]
         batch_size = 1
         spatial_shape = (
@@ -305,6 +325,8 @@ class GaussianBackbone3D(nn.Module):
         semantic_logits = self.semantic_head(encoded)  # SparseConvTensor
         semantic_logits_dense = semantic_logits.features  # [N_voxel, num_classes]
         semantic_probs = F.softmax(semantic_logits_dense, dim=-1)  # [N_voxel, num_classes] per-voxel class prob
+        # print(f"[backbone3d_semantic] semantic_logits_dense: {semantic_logits_dense.shape}")
+        # print(f"[backbone3d_semantic] semantic_logits_dense max: {semantic_logits_dense.max()}, min: {semantic_logits_dense.min()}")
         
         # 数值稳定性检查
         if torch.isnan(semantic_probs).any():
@@ -392,8 +414,11 @@ class GaussianBackbone3D(nn.Module):
 
         # step 7: 优化的TPV投影
         tpv_xy = self._project_to_plane_optimized(voxel_features, voxel_coords, 'xy', device, batch_size)
+        #torch.Size([1, 128, 200, 704])
         tpv_xz = self._project_to_plane_optimized(voxel_features, voxel_coords, 'xz', device, batch_size)
+        #torch.Size([1, 128, 704, 16])
         tpv_yz = self._project_to_plane_optimized(voxel_features, voxel_coords, 'yz', device, batch_size)
+        #torch.Size([1, 128, 200, 16])
 
         if agent is not None:
             batch_dict[agent]['tpv_xy'] = tpv_xy
@@ -512,16 +537,16 @@ class Gaussian3DBackbone(nn.Module):
         # 从model_cfg中获取grid_size, voxel_size, point_cloud_range
         # 如果未提供则使用默认值
         # grid_size 语义为 [H, W, Z] = [y, x, z]
-        H, W, Z = self.model_cfg.get('GRID_SIZE', [200, 704, 40])
+        H, W, Z = self.model_cfg.get('GRID_SIZE')
         self.grid_size_hwz = [H, W, Z]  # 保存为 [H, W, Z] 语义
-        self.voxel_size =  self.model_cfg.get('VOXEL_SIZE', [0.4,0.4,2.0])
-        self.point_cloud_range =  self.model_cfg.get('POINT_CLOUD_RANGE', [-140.8, -40.0, -70.0, 140.8, 40.0, 10.0])
+        self.voxel_size =  self.model_cfg.get('VOXEL_SIZE')
+        self.point_cloud_range =  self.model_cfg.get('POINT_CLOUD_RANGE')
         
         # 1. VFE配置
         vfe_cfg = self.model_cfg.get('VFE', {})
         vfe_cfg.setdefault('USE_NORM', True)
         vfe_cfg.setdefault('WITH_DISTANCE', False)
-        vfe_cfg.setdefault('USE_ABSLOTE_XYZ', True)
+        vfe_cfg.setdefault('USE_ABSOLUTE_XYZ', True)
         vfe_cfg.setdefault('NUM_FILTERS', [128, 128])
         vfe_cfg.setdefault('RETURN_ABS_COORDS', False)
         
@@ -529,7 +554,7 @@ class Gaussian3DBackbone(nn.Module):
         backbone_cfg = self.model_cfg.get('BACKBONE_3D', {})
         backbone_cfg.setdefault('NUM_FEATURES', 128)
         backbone_cfg.setdefault('HIDDEN_DIM', 128)
-        backbone_cfg.setdefault('MAX_GAUSSIAN_RATIO', 0.05)
+        backbone_cfg.setdefault('MAX_GAUSSIAN_RATIO', 0.2)
         backbone_cfg.setdefault('PROJECTION_METHOD', 'scatter_mean')
         backbone_cfg.setdefault('USE_GUMBEL', False)
         backbone_cfg.setdefault('GUMBEL_TEMPERATURE', 0.1)
@@ -541,7 +566,7 @@ class Gaussian3DBackbone(nn.Module):
             model_cfg=vfe_cfg,
             num_point_features=num_point_features,
             voxel_size=self.voxel_size,
-            grid_size=[W, H, Z],  # [x, y, z] 语义
+            grid_size=[H, W, Z],
             point_cloud_range=self.point_cloud_range
         )
         
@@ -556,8 +581,139 @@ class Gaussian3DBackbone(nn.Module):
         
         print(f"[Gaussian3DBackbone] 初始化完成:")
         print(f"  - VFE Filters: {vfe_cfg['NUM_FILTERS']}")
-        print(f"  - Backbone Features: {backbone_cfg.get('NUM_FEATURES', 128)}")
+        print(f"  - Backbone Features: {backbone_cfg.get('NUM_FEATURES')}")
         print(f"  - Grid Size: {self.grid_size_hwz} [H, W, Z]")
+    
+    # TODO： 还未添加调用这个函数的代码
+    def load_pretrained_weights(self, checkpoint_path, strict=True, freeze_pretrained=True):
+        """
+        加载预训练权重到整个流程：VFE → Encoder → Semantic Head
+        
+        预训练包含的模块（包含可训练参数）：
+        1. VFE (DynamicVoxelVFE): 点云 → 体素特征
+           - 包含 pfn_layers 等可训练参数
+        2. Encoder: 稀疏卷积编码器
+           - 包含 SubMConv3d 和 SparseBatchNorm 等可训练参数
+        3. Semantic Head: 语义分类头
+           - 包含 SubMConv3d 等可训练参数
+        
+        注意：SparseConvTensor 只是数据格式转换（不包含参数），无需加载权重
+        
+        完整流程：
+        原始点云 → VFE → SparseConvTensor(格式转换) → Encoder → Semantic Head → 语义logits
+        
+        Args:
+            checkpoint_path (str): checkpoint文件路径
+            strict (bool): 是否严格匹配所有键
+            freeze_pretrained (bool): 是否冻结预训练的模块，默认True
+        
+        Returns:
+            missing_keys (list): 缺失的键
+            unexpected_keys (list): 意外的键
+        """
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        # 如果checkpoint包含model_state_dict，则提取它
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+        
+        # 获取当前模型的状态字典
+        vfe_state_dict = self.vfe.state_dict()
+        backbone_state_dict = self.backbone.state_dict()
+        
+        # 收集需要加载的权重
+        vfe_pretrained = {}
+        backbone_pretrained = {}
+        
+        for k, v in state_dict.items():
+            # 匹配VFE的权重
+            if k.startswith('vfe.'):
+                new_key = k.replace('vfe.', '')
+                if new_key in vfe_state_dict:
+                    vfe_pretrained[new_key] = v
+            elif not k.startswith('backbone.') and not k.startswith('encoder.') and not k.startswith('semantic_head.'):
+                # 尝试直接匹配VFE的键（如果checkpoint中没有'vfe.'前缀）
+                if k in vfe_state_dict:
+                    vfe_pretrained[k] = v
+            
+            # 匹配backbone的encoder和semantic_head权重
+            if k.startswith('backbone.encoder.') or k.startswith('backbone.semantic_head.'):
+                # 去掉'backbone.'前缀
+                new_key = k.replace('backbone.', '')
+                if new_key in backbone_state_dict:
+                    backbone_pretrained[new_key] = v
+            elif k.startswith('encoder.') or k.startswith('semantic_head.'):
+                # 直接匹配encoder或semantic_head的键
+                if k in backbone_state_dict:
+                    backbone_pretrained[k] = v
+        
+        # 加载VFE权重
+        vfe_missing, vfe_unexpected = self.vfe.load_state_dict(vfe_pretrained, strict=strict)
+        
+        # 加载backbone权重
+        backbone_missing, backbone_unexpected = self.backbone.load_state_dict(backbone_pretrained, strict=strict)
+        
+        # 合并缺失和意外的键
+        missing_keys = list(set(vfe_missing + backbone_missing))
+        unexpected_keys = list(set(vfe_unexpected + backbone_unexpected))
+        
+        # 如果设置了freeze_pretrained，冻结这些模块
+        if freeze_pretrained:
+            self.freeze_pretrained_modules()
+        
+        print(f"[Gaussian3DBackbone] 加载预训练权重:")
+        print(f"  - Checkpoint: {checkpoint_path}")
+        print(f"  - VFE加载的键数量: {len(vfe_pretrained)}")
+        print(f"  - Backbone加载的键数量: {len(backbone_pretrained)}")
+        print(f"  - 总加载键数量: {len(vfe_pretrained) + len(backbone_pretrained)}")
+        if missing_keys:
+            print(f"  - 缺失的键: {len(missing_keys)} 个")
+            if len(missing_keys) <= 10:
+                for key in missing_keys:
+                    print(f"    - {key}")
+        if unexpected_keys:
+            print(f"  - 意外的键: {len(unexpected_keys)} 个")
+            if len(unexpected_keys) <= 10:
+                for key in unexpected_keys:
+                    print(f"    - {key}")
+        
+        return missing_keys, unexpected_keys
+    
+    def freeze_pretrained_modules(self):
+        """
+        冻结预训练的模块（VFE、Encoder、Semantic Head）
+        用于正式训练时，只训练未预训练的部分（如feature_proj、semantic_mlp等）
+        """
+        # 冻结VFE
+        for param in self.vfe.parameters():
+            param.requires_grad = False
+        
+        # 冻结Encoder和Semantic Head
+        for param in self.backbone.encoder.parameters():
+            param.requires_grad = False
+        for param in self.backbone.semantic_head.parameters():
+            param.requires_grad = False
+        
+        print("[Gaussian3DBackbone] 已冻结预训练模块:")
+        print("  - VFE (DynamicVoxelVFE)")
+        print("  - Encoder")
+        print("  - Semantic Head")
+        print("  - 将继续训练: feature_proj, semantic_mlp 等模块")
+    
+    def unfreeze_all_modules(self):
+        """
+        解冻所有模块，恢复训练所有参数
+        """
+        for param in self.vfe.parameters():
+            param.requires_grad = True
+        for param in self.backbone.encoder.parameters():
+            param.requires_grad = True
+        for param in self.backbone.semantic_head.parameters():
+            param.requires_grad = True
+        
+        print("[Gaussian3DBackbone] 已解冻所有模块")
     
     def forward(self, batch_dict, available_agent=None, **kwargs):
         """
@@ -775,7 +931,7 @@ model_cfg 结构:
     'VFE': {
         'USE_NORM': True,               # 是否使用BatchNorm
         'WITH_DISTANCE': False,         # 是否添加距离特征
-        'USE_ABSLOTE_XYZ': True,       # 是否使用绝对坐标
+        'USE_ABSOLUTE_XYZ': True,       # 是否使用绝对坐标
         'NUM_FILTERS': [128, 128],     # PointNet层特征维度 [in_features, out_features]
         'RETURN_ABS_COORDS': False      # 是否返回绝对坐标高度
     },

@@ -21,6 +21,31 @@ from ..ops.win_coors.flattened_window_cuda import get_window_coors_shift_v2 as g
 from ..ops.win_coors.flattened_window_cuda import flattened_window_mapping as flattened_window_mapping_cuda
 from ..ops.win_coors.flattened_window_cuda import get_window_coors_shift_v3 as get_window_coors_shift_v3_cuda
 from ..ops.win_coors.flattened_window_cuda import expand_selected_coords as expand_selected_coords_cuda
+
+
+def _propagate_instance_voxel_mask(instance_mask, unq_inv, out_size):
+    if instance_mask is None:
+        return None
+
+    if instance_mask.ndim != 2:
+        raise ValueError(
+            f"Expected instance_voxel_mask to have shape [num_instances, num_voxels], got {tuple(instance_mask.shape)}"
+        )
+    if instance_mask.shape[1] != unq_inv.shape[0]:
+        raise ValueError(
+            "instance_voxel_mask is not aligned with the current voxel tensor: "
+            f"mask has {instance_mask.shape[1]} columns but unq_inv has length {unq_inv.shape[0]}"
+        )
+
+    propagated_mask = instance_mask.new_zeros((instance_mask.shape[0], out_size))
+    for inst_idx in range(instance_mask.shape[0]):
+        active_voxel_indices = torch.nonzero(instance_mask[inst_idx], as_tuple=False).squeeze(-1)
+        if active_voxel_indices.numel() == 0:
+            continue
+        propagated_mask[inst_idx, torch.unique(unq_inv[active_voxel_indices].long())] = True
+    return propagated_mask
+
+
 @torch.inference_mode()
 def get_window_coors_shift_v2(coords, sparse_shape, window_shape, shift=False):
     sparse_shape_z, sparse_shape_y, sparse_shape_x = sparse_shape
@@ -713,9 +738,19 @@ class PatchMerging3D(nn.Module):
     #     return x_merge, unq_inv
 
     # @torch.jit.script
-    def forward(self, x, coords_shift=1, diffusion_scale=4, ori_coords_height=None):
+    def forward(self, x, coords_shift=1, diffusion_scale=4, ori_coords_height=None, instance_mask=None):
         assert diffusion_scale==4 or diffusion_scale==2
         x = self.sub_conv(x)
+        if instance_mask is not None:
+            if instance_mask.ndim != 2:
+                raise ValueError(
+                    f"Expected instance_mask to have shape [num_instances, num_voxels], got {tuple(instance_mask.shape)}"
+                )
+            if instance_mask.shape[1] != x.features.shape[0]:
+                raise ValueError(
+                    "instance_mask is not aligned with sparse voxels before PatchMerging3D: "
+                    f"mask has {instance_mask.shape[1]} columns but sparse tensor has {x.features.shape[0]} voxels"
+                )
 
         d, h, w = x.spatial_shape
         down_scale = self.down_scale
@@ -726,6 +761,8 @@ class PatchMerging3D(nn.Module):
             batch_size = x.batch_size
             selected_diffusion_feats_list = [x.features.clone()]
             selected_diffusion_coords_list = [x.indices.clone()]
+            if instance_mask is not None:
+                selected_diffusion_mask_list = [instance_mask.clone()]
             if self.return_abs_coords:
                 selected_ori_coords_height_list = [ori_coords_height.clone()]
             for i in range(batch_size):
@@ -739,6 +776,8 @@ class PatchMerging3D(nn.Module):
                 selected_coords_expand = selected_coords_copy.repeat(diffusion_scale, 1) # [13488, 4]
                 feats_expand_N, feats_expand_M = x.features[mask][indices].shape
                 selected_feats_expand = torch.zeros(feats_expand_N * diffusion_scale, feats_expand_M, device=x.features.device) # [13488, 128]
+                if instance_mask is not None:
+                    selected_instance_mask = instance_mask[:, mask][:, indices].repeat(1, diffusion_scale)
                 # selected_feats_expand = x.features[mask][indices].repeat(diffusion_scale, 1) * 0.0 # [13488, 128]
                 if self.return_abs_coords:
                     selected_ori_coords_height = ori_coords_height[mask][indices].repeat(diffusion_scale)
@@ -798,6 +837,8 @@ class PatchMerging3D(nn.Module):
                     mask_new = mask_new & unique_mask
                     selected_diffusion_coords_list.append(selected_coords_expand[mask_new])
                     selected_diffusion_feats_list.append(selected_feats_expand[mask_new])
+                    if instance_mask is not None:
+                        selected_diffusion_mask_list.append(selected_instance_mask[:, mask_new])
                     selected_ori_coords_height_list.append(selected_ori_coords_height[mask_new])
                     # selected_diffusion_coords_list.append(selected_coords_expand)
                     # selected_diffusion_feats_list.append(selected_feats_expand)
@@ -805,18 +846,24 @@ class PatchMerging3D(nn.Module):
                 else:
                     selected_diffusion_coords_list.append(selected_coords_expand)
                     selected_diffusion_feats_list.append(selected_feats_expand)
+                    if instance_mask is not None:
+                        selected_diffusion_mask_list.append(selected_instance_mask)
                 # assert torch.allclose(selected_coords_expand, selected_coords_expand_new) and torch.allclose(selected_feats_expand, selected_feats_expand_new), 'Error in expand_selected_coords_cuda'
                 # if self.return_abs_coords:
                 #     selected_ori_coords_height_list.append(selected_ori_coords_height)
 
             coords = torch.cat(selected_diffusion_coords_list)
             final_diffusion_feats = torch.cat(selected_diffusion_feats_list)
+            if instance_mask is not None:
+                final_instance_mask = torch.cat(selected_diffusion_mask_list, dim=1)
             if self.return_abs_coords:
                 final_ori_coords_height = torch.cat(selected_ori_coords_height_list)
 
         else:
             coords = x.indices.clone()
             final_diffusion_feats = x.features.clone()
+            if instance_mask is not None:
+                final_instance_mask = instance_mask.clone()
 
         # if self.return_abs_coords:
         #     new_coords_height = new_coords_height[ma]
@@ -838,6 +885,10 @@ class PatchMerging3D(nn.Module):
         unq_coords, unq_inv = torch.unique(merge_coords, return_inverse=True, return_counts=False, dim=0)
 
         x_merge = torch_scatter.scatter_add(features_expand, unq_inv, dim=0)
+        if instance_mask is not None:
+            merged_instance_mask = _propagate_instance_voxel_mask(
+                final_instance_mask, unq_inv, unq_coords.shape[0]
+            )
         if self.return_abs_coords:
             # assert torch.unique(merge_coords, return_inverse=True, return_counts=True, dim=0)[2].max() == 2
             final_ori_coords_height_merged = torch_scatter.scatter_mean(final_ori_coords_height, unq_inv, dim=0)
@@ -857,6 +908,10 @@ class PatchMerging3D(nn.Module):
             spatial_shape=new_sparse_shape,
             batch_size=x.batch_size
         )
+        if instance_mask is not None and self.return_abs_coords:
+            return x_merge, unq_inv, merged_instance_mask, final_ori_coords_height_merged
+        if instance_mask is not None:
+            return x_merge, unq_inv, merged_instance_mask
         if self.return_abs_coords:
             return x_merge, unq_inv, final_ori_coords_height_merged
         return x_merge, unq_inv
@@ -1269,7 +1324,6 @@ class LION3DBackboneOneStride(nn.Module):
         norm_fn = partial(nn.LayerNorm)
 
         dim = model_cfg.FEATURE_DIM
-        num_layers = model_cfg.NUM_LAYERS
         depths = model_cfg.DEPTHS
         layer_down_scales = model_cfg.LAYER_DOWN_SCALES
         direction = model_cfg.DIRECTION
@@ -1280,10 +1334,9 @@ class LION3DBackboneOneStride(nn.Module):
         self.group_size = model_cfg.GROUP_SIZE
         self.layer_dim = model_cfg.LAYER_DIM
         self.linear_operator = model_cfg.OPERATOR
-        
-        # 新增
+        self.use_height_fidelity = model_cfg.RETURN_ABS_COORDS
         self.use_prebackbone = model_cfg.get('USE_PREBACKBONE', False)
-        self.use_height_fidelity = model_cfg.get('RETURN_ABS_COORDS', False)
+        
         self.n_layer = len(depths) * depths[0] * 2 * 2 + 2
         self.agent = ['veh','drone','rsu']
         down_scale_list = [[2, 2, 2],
@@ -1297,7 +1350,6 @@ class LION3DBackboneOneStride(nn.Module):
             tmp_dow_scale = [x * y for x, y in zip(total_down_scale_list[i], down_scale_list[i + 1])]
             total_down_scale_list.append(tmp_dow_scale)
 
-        assert num_layers == len(depths)
         assert len(layer_down_scales) == len(depths)
         assert len(layer_down_scales[0]) == depths[0]
         assert len(self.layer_dim) == len(depths)
@@ -1332,10 +1384,10 @@ class LION3DBackboneOneStride(nn.Module):
         self.dow4 = PatchMerging3D(self.layer_dim[3], self.layer_dim[3], down_scale=[1, 1, 2],
                                      norm_layer=norm_fn, diffusion=diffusion, diff_scale=diff_scale, return_abs_coords=self.use_height_fidelity)
 
-        self.linear_out = LIONLayer(self.layer_dim[3], 1, [13, 13, 2], 256, direction=['x', 'y'], shift=shift,
+        self.linear_out = LIONLayer(self.layer_dim[3], 1, [16, 10, 2], 256, direction=['x', 'y'], shift=shift,
                                       operator=self.linear_operator, layer_id=32, n_layer=self.n_layer)
         self.use_dow5 = model_cfg.get('USE_DOW5', False)
-        self.dow5_diff = model_cfg.get('DOW5_DIFF', True)
+        self.dow5_diff = model_cfg.get('DOW5_DIFF', False)
         if self.use_dow5:
             self.dow5 = PatchMerging3D(self.layer_dim[3], self.layer_dim[3], down_scale=[1, 1, 2],
                                         norm_layer=norm_fn, diffusion=self.dow5_diff and diffusion, diff_scale=diff_scale, return_abs_coords=self.use_height_fidelity)
@@ -1350,14 +1402,27 @@ class LION3DBackboneOneStride(nn.Module):
         }
 
     def forward(self, batch_dict, agent = None):
-        if 'voxel_features' not in batch_dict[agent]:
-            return batch_dict
         
         voxel_features = batch_dict[agent]['voxel_features']
         voxel_coords = batch_dict[agent]['voxel_coords']
-            
+        instance_voxel_mask = batch_dict[agent].get('instance_voxel_mask')
+        
         # 从voxel_coords中获取真实的batch_size
-        batch_size = voxel_coords[:, 0].max().int().item() + 1
+        batch_size = batch_dict['batch_size']
+        if instance_voxel_mask is not None:
+            instance_voxel_mask = instance_voxel_mask.bool().to(voxel_features.device)
+            if batch_size != 1:
+                raise NotImplementedError(
+                    "instance_voxel_mask propagation in LION3DBackboneOneStride currently assumes batch_size == 1."
+                )
+            if instance_voxel_mask.shape[1] != voxel_features.shape[0]:
+                raise ValueError(
+                    "instance_voxel_mask is not aligned with pre-backbone voxels: "
+                    f"mask has {instance_voxel_mask.shape[1]} columns but voxel_features has {voxel_features.shape[0]} rows"
+                )
+            batch_dict[agent].setdefault(
+                'instance_voxel_mask_pre_backbone', instance_voxel_mask.clone()
+            )
 
         x = spconv.SparseConvTensor(
             features=voxel_features,
@@ -1370,46 +1435,81 @@ class LION3DBackboneOneStride(nn.Module):
                 ori_coords_height = batch_dict[agent]['ori_coords_height']
             else:
                 raise ValueError(f"ori_coords_height not found in batch_dict[{agent}]. Keys: {list(batch_dict[agent].keys())}")
-            #ori_coords_height = batch_dict['ori_coords_height']
+            
             x = self.linear_1(x)
-            x1, _, ori_coords_height = self.dow1(x, ori_coords_height=ori_coords_height)  ## 14.0k --> 16.9k  [32, 1000, 1000]-->[16, 1000, 1000]
-            batch_dict[agent]['ori_coords_height_coords1'] = ori_coords_height
+            if instance_voxel_mask is not None:
+                x1, _, instance_voxel_mask, ori_coords_height = self.dow1(
+                    x, ori_coords_height=ori_coords_height, instance_mask=instance_voxel_mask
+                )  ## 14.0k --> 16.9k  [32, 1000, 1000]-->[16, 1000, 1000]
+            else:
+                x1, _, ori_coords_height = self.dow1(x, ori_coords_height=ori_coords_height)  ## 14.0k --> 16.9k  [32, 1000, 1000]-->[16, 1000, 1000]
 
             x = self.linear_2(x1)
-            x2, _, ori_coords_height = self.dow2(x, ori_coords_height=ori_coords_height)  ## 16.9k --> 18.8k  [16, 1000, 1000]-->[8, 1000, 1000]
-            batch_dict[agent]['ori_coords_height_coords2'] = ori_coords_height
+            if instance_voxel_mask is not None:
+                x2, _, instance_voxel_mask, ori_coords_height = self.dow2(
+                    x, ori_coords_height=ori_coords_height, instance_mask=instance_voxel_mask
+                )  ## 16.9k --> 18.8k  [16, 1000, 1000]-->[8, 1000, 1000]
+            else:
+                x2, _, ori_coords_height = self.dow2(x, ori_coords_height=ori_coords_height)  ## 16.9k --> 18.8k  [16, 1000, 1000]-->[8, 1000, 1000]
 
             x = self.linear_3(x2)
-            x3, _, ori_coords_height= self.dow3(x, ori_coords_height=ori_coords_height)   ## 18.8k --> 19.1k  [8, 1000, 1000]-->[4, 1000, 1000]
-            batch_dict[agent]['ori_coords_height_coords3'] = ori_coords_height
+            if instance_voxel_mask is not None:
+                x3, _, instance_voxel_mask, ori_coords_height = self.dow3(
+                    x, ori_coords_height=ori_coords_height, instance_mask=instance_voxel_mask
+                )   ## 18.8k --> 19.1k  [8, 1000, 1000]-->[4, 1000, 1000]
+            else:
+                x3, _, ori_coords_height= self.dow3(x, ori_coords_height=ori_coords_height)   ## 18.8k --> 19.1k  [8, 1000, 1000]-->[4, 1000, 1000]
             
             # 应该在这里插入需要融合的token
             # 可以先试试插入重点位置的token
             x = self.linear_4(x3)
-
-            x4, _, ori_coords_height = self.dow4(x, ori_coords_height=ori_coords_height)  ## 19.1k --> 18.5k  [4, 1000, 1000]-->[2, 1000, 1000]
-            batch_dict[agent]['ori_coords_height_coords4'] = ori_coords_height
+            if instance_voxel_mask is not None:
+                x4, _, instance_voxel_mask, ori_coords_height = self.dow4(
+                    x, ori_coords_height=ori_coords_height, instance_mask=instance_voxel_mask
+                )  ## 19.1k --> 18.5k  [4, 1000, 1000]-->[2, 1000, 1000]
+            else:
+                x4, _, ori_coords_height = self.dow4(x, ori_coords_height=ori_coords_height)  ## 19.1k --> 18.5k  [4, 1000, 1000]-->[2, 1000, 1000]
             x = self.linear_out(x4)
             
             if self.use_dow5:
-                x, _, ori_coords_height = self.dow5(x, ori_coords_height=ori_coords_height)  ## 18.5k --> 18.5k  [2, 1000, 1000]-->[1, 1000, 1000]
+                if instance_voxel_mask is not None:
+                    x, _, instance_voxel_mask, ori_coords_height = self.dow5(
+                        x, ori_coords_height=ori_coords_height, instance_mask=instance_voxel_mask
+                    )  ## 18.5k --> 18.5k  [2, 1000, 1000]-->[1, 1000, 1000]
+                else:
+                    x, _, ori_coords_height = self.dow5(x, ori_coords_height=ori_coords_height)  ## 18.5k --> 18.5k  [2, 1000, 1000]-->[1, 1000, 1000]
             batch_dict[agent]['ori_coords_height'] = ori_coords_height
         else:
             x = self.linear_1(x)
-            x1, _ = self.dow1(x)  ## 14.0k --> 16.9k  [32, 1000, 1000]-->[16, 1000, 1000]
+            if instance_voxel_mask is not None:
+                x1, _, instance_voxel_mask = self.dow1(x, instance_mask=instance_voxel_mask)  ## 14.0k --> 16.9k  [32, 1000, 1000]-->[16, 1000, 1000]
+            else:
+                x1, _ = self.dow1(x)  ## 14.0k --> 16.9k  [32, 1000, 1000]-->[16, 1000, 1000]
             x = self.linear_2(x1)
-            x2, _ = self.dow2(x)  ## 16.9k --> 18.8k  [16, 1000, 1000]-->[8, 1000, 1000]
+            if instance_voxel_mask is not None:
+                x2, _, instance_voxel_mask = self.dow2(x, instance_mask=instance_voxel_mask)  ## 16.9k --> 18.8k  [16, 1000, 1000]-->[8, 1000, 1000]
+            else:
+                x2, _ = self.dow2(x)  ## 16.9k --> 18.8k  [16, 1000, 1000]-->[8, 1000, 1000]
             x = self.linear_3(x2)
-            x3, _ = self.dow3(x)   ## 18.8k --> 19.1k  [8, 1000, 1000]-->[4, 1000, 1000]
+            if instance_voxel_mask is not None:
+                x3, _, instance_voxel_mask = self.dow3(x, instance_mask=instance_voxel_mask)   ## 18.8k --> 19.1k  [8, 1000, 1000]-->[4, 1000, 1000]
+            else:
+                x3, _ = self.dow3(x)   ## 18.8k --> 19.1k  [8, 1000, 1000]-->[4, 1000, 1000]
             x = self.linear_4(x3)
 
-            x4, _ = self.dow4(x)  ## 19.1k --> 18.5k  [4, 1000, 1000]-->[2, 1000, 1000]
+            if instance_voxel_mask is not None:
+                x4, _, instance_voxel_mask = self.dow4(x, instance_mask=instance_voxel_mask)  ## 19.1k --> 18.5k  [4, 1000, 1000]-->[2, 1000, 1000]
+            else:
+                x4, _ = self.dow4(x)  ## 19.1k --> 18.5k  [4, 1000, 1000]-->[2, 1000, 1000]
             x = self.linear_out(x4)
             
             if self.use_dow5:
                 # import copy
                 # x_ori = copy.deepcopy(x)
-                x, _ = self.dow5(x)  ## 18.5k --> 18.5k  [2, 1000, 1000]-->[1, 1000, 1000]
+                if instance_voxel_mask is not None:
+                    x, _, instance_voxel_mask = self.dow5(x, instance_mask=instance_voxel_mask)  ## 18.5k --> 18.5k  [2, 1000, 1000]-->[1, 1000, 1000]
+                else:
+                    x, _ = self.dow5(x)  ## 18.5k --> 18.5k  [2, 1000, 1000]-->[1, 1000, 1000]
 
 
 
@@ -1419,10 +1519,10 @@ class LION3DBackboneOneStride(nn.Module):
         # if self.use_dow5:
         #     x, _ = self.dow5(x)  ## 18.5k --> 18.5k  [2, 1000, 1000]-->[1, 1000, 1000]
 
-        batch_dict[agent].update({
-            'encoded_spconv_tensor': x,
-            'encoded_spconv_tensor_stride': 1
-        })
+        # batch_dict[agent].update({
+        #     'encoded_spconv_tensor': x,
+        #     'encoded_spconv_tensor_stride': 1
+        # })
 
         batch_dict[agent].update({
             'multi_scale_3d_features': {
@@ -1440,7 +1540,6 @@ class LION3DBackboneOneStride(nn.Module):
                 'x_conv4': torch.tensor([1,1,16], device=x1.features.device).float(),
             }
         })
-
         batch_dict[agent]['voxel_coords'] = x.indices
         # assert batch_dict['voxel_coords'][:, 1].max() == 0 and batch_dict['voxel_coords'][:, 1].min() == 0
         assert batch_dict[agent]['voxel_coords'][:, 0].max() == batch_size - 1 and batch_dict[agent]['voxel_coords'][:, 0].min() == 0
@@ -1448,6 +1547,10 @@ class LION3DBackboneOneStride(nn.Module):
         assert batch_dict[agent]['voxel_coords'][:, 2].max() < self.sparse_shape[1] and batch_dict[agent]['voxel_coords'][:, 2].min() >= 0
         assert batch_dict[agent]['voxel_coords'][:, 3].max() < self.sparse_shape[2] and batch_dict[agent]['voxel_coords'][:, 3].min() >= 0
         batch_dict[agent]['pillar_features'] = batch_dict[agent]['voxel_features'] = x.features
+        if instance_voxel_mask is not None:
+            batch_dict[agent]['instance_voxel_mask'] = instance_voxel_mask
+            batch_dict[agent]['instance_valid_mask'] = instance_voxel_mask.any(dim=1)
+        
         return batch_dict
 
     def load_template(self, path, rank):

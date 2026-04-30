@@ -84,6 +84,9 @@ class PointPillarLossMultiClass(nn.Module):
 
         self.cls_weight = args["cls_weight"]
         self.reg_coe = args["reg"]
+        self.obj_weight = args.get("obj_weight", 1.0)
+        self.iou_weight = args.get("iou_weight", 0.0)  # 0.0 means disabled
+        self.recall_weight = args.get("recall_weight", 0.0)  # 0.0 means disabled, for encouraging more detections
         self.flow_weight = args["flow_weight"] if "flow_weight" in args else 1.0
         self.loss_dict = {}
         self.use_dir = False
@@ -107,16 +110,6 @@ class PointPillarLossMultiClass(nn.Module):
         obj = output_dict["obj{}".format(prefix)]  # [B, #anchor, 50, 176]
         targets = target_dict["targets"]
         
-        # 调试信息：打印输入尺寸
-        print(f"[Loss Debug] psm shape: {psm.shape}")
-        print(f"[Loss Debug] rm shape: {rm.shape}")
-        print(f"[Loss Debug] obj shape: {obj.shape}")
-        print(f"[Loss Debug] targets shape: {targets.shape}")
-        print(f"[Loss Debug] pos_equal_one shape: {target_dict['pos_equal_one'].shape}")
-        print(f"[Loss Debug] neg_equal_one shape: {target_dict['neg_equal_one'].shape}")
-        if 'class_ids' in target_dict:
-            print(f"[Loss Debug] class_ids shape: {target_dict['class_ids'].shape}")
-
         cls_preds = psm.permute(0, 2, 3, 1).contiguous()  # N, C, H, W -> N, H, W, C
         obj_preds = obj.permute(0, 2, 3, 1).contiguous()  # (B, H, W, A)
         box_cls_labels = target_dict["pos_equal_one"]  # [B, 50, 176, 2]
@@ -132,15 +125,8 @@ class PointPillarLossMultiClass(nn.Module):
         neg_mask = target_dict["neg_equal_one"]  # (B, H, W, A)
 
         pos_normalizer = positives.sum(1, keepdim=True).float()
-        print(f"[Loss Debug] positives sum: {positives.sum()}")
-        print(f"[Loss Debug] pos_normalizer: {pos_normalizer}")
-        print(f"[Loss Debug] cls_weights before normalization: {cls_weights.sum()}")
-        print(f"[Loss Debug] cls_weights before normalization shape: {cls_weights.shape}")
-        print(f"[Loss Debug] cls_weights before normalization min/max: {cls_weights.min()}/{cls_weights.max()}")
         reg_weights /= torch.clamp(pos_normalizer, min=1.0)
         cls_weights /= torch.clamp(pos_normalizer, min=1.0)
-        print(f"[Loss Debug] cls_weights after normalization: {cls_weights.sum()}")
-        print(f"[Loss Debug] cls_weights after normalization min/max: {cls_weights.min()}/{cls_weights.max()}")
         cls_labels = target_dict["class_ids"]  # [B, H, W, A]
         cls_targets = cls_labels
         one_hot_targets = torch.zeros(
@@ -153,34 +139,13 @@ class PointPillarLossMultiClass(nn.Module):
         cls_labels = one_hot_targets.view(
             cls_targets.shape[0], cls_targets.shape[1], cls_targets.shape[2], -1
         )
-        # 调试信息：检查尺寸匹配
-        print(f"[Loss Debug] cls_labels shape: {cls_labels.shape}")
-        print(f"[Loss Debug] cls_preds shape: {cls_preds.shape}")
-        print(f"[Loss Debug] cls_weights shape: {cls_weights.shape}")
-        print(f"[Loss Debug] cls_weights sum: {cls_weights.sum()}")
-        print(f"[Loss Debug] cls_weights min/max: {cls_weights.min()}/{cls_weights.max()}")
-        
-        if cls_labels.shape != cls_preds.shape:
-            print(f"[Loss Debug] ERROR: Size mismatch!")
-            print(f"[Loss Debug] cls_labels: {cls_labels.shape}")
-            print(f"[Loss Debug] cls_preds: {cls_preds.shape}")
-            # 尝试调整尺寸
-            if cls_labels.shape[0] == cls_preds.shape[0] and cls_labels.shape[3] == cls_preds.shape[3]:
-                print(f"[Loss Debug] Attempting to resize cls_preds to match cls_labels")
-                cls_preds = F.interpolate(cls_preds.permute(0, 3, 1, 2), size=(cls_labels.shape[1], cls_labels.shape[2]), mode='bilinear', align_corners=False).permute(0, 2, 3, 1)
-                print(f"[Loss Debug] Resized cls_preds shape: {cls_preds.shape}")
         
         cls_loss_src = self.cls_loss_func(
             cls_preds, cls_labels, weights=cls_weights
         )  # [N, M]
-        print(f"[Loss Debug] cls_loss_src shape: {cls_loss_src.shape}")
-        print(f"[Loss Debug] cls_loss_src sum: {cls_loss_src.sum()}")
-        print(f"[Loss Debug] cls_loss_src min/max: {cls_loss_src.min()}/{cls_loss_src.max()}")
         
         cls_loss = cls_loss_src.sum() / psm.shape[0]
         conf_loss = cls_loss * self.cls_weight
-        print(f"[Loss Debug] cls_loss: {cls_loss}")
-        print(f"[Loss Debug] conf_loss: {conf_loss}")
 
         # regression
         rm = rm.permute(0, 2, 3, 1).contiguous()
@@ -193,32 +158,82 @@ class PointPillarLossMultiClass(nn.Module):
 
         reg_loss = loc_loss_src.sum() / rm.shape[0]
         reg_loss *= self.reg_coe
-        print(f"[Loss Debug] reg_loss: {reg_loss}")
 
-        # TODO(YH): check obj loss, consider how to weight this
-        obj_preds_sigmoid = torch.sigmoid(obj_preds)
-        bce = -(
-            pos_mask * torch.log(obj_preds_sigmoid + 1e-6)
-            + (1 - pos_mask) * torch.log(1 - obj_preds_sigmoid + 1e-6)
+        # objectness loss using Focal Loss (reuse obj_loss_func)
+        obj_preds_expanded = obj_preds.unsqueeze(-1)  # [B, H, W, A] -> [B, H, W, A, 1]
+        pos_mask_expanded = pos_mask.unsqueeze(-1).float()  # [B, H, W, A] -> [B, H, W, A, 1]
+        obj_loss_src = self.obj_loss_func(
+            obj_preds_expanded,  # input: logits
+            pos_mask_expanded,   # target: 0/1
+            torch.ones_like(pos_mask_expanded)  # weights: all ones
         )
-        obj_loss = bce.mean()
-        print(f"[Loss Debug] obj_loss: {obj_loss}")
+        # Use mean (same as original implementation)
+        obj_loss = obj_loss_src.mean()
+        obj_loss_weighted = obj_loss * self.obj_weight
 
-        total_loss = reg_loss + conf_loss + obj_loss
-        print(f"[Loss Debug] total_loss breakdown:")
-        print(f"[Loss Debug]   reg_loss: {reg_loss}")
-        print(f"[Loss Debug]   conf_loss: {conf_loss}")
-        print(f"[Loss Debug]   obj_loss: {obj_loss}")
-        print(f"[Loss Debug]   total_loss: {total_loss}")
+        total_loss = reg_loss + conf_loss + obj_loss_weighted
 
-        self.loss_dict.update(
-            {
+        # Recall loss (optional, only if recall_weight > 0)
+        # Use BCE loss on positive samples ONLY to encourage higher confidence predictions
+        # This helps address the issue of too few detections by penalizing low confidence on GT positives
+        recall_loss_weighted = 0.0
+        if self.recall_weight > 0 and positives.sum() > 0:
+            # Flatten obj_preds and pos_mask
+            obj_preds_flat = obj_preds.view(psm.shape[0], -1)  # [B, H*W*A]
+            pos_mask_flat = pos_mask.view(psm.shape[0], -1)  # [B, H*W*A]
+            
+            # Extract ONLY positive samples for loss calculation
+            pos_indices = pos_mask_flat > 0  # [B, H*W*A]
+            if pos_indices.sum() > 0:
+                # Get positive samples only
+                pos_obj_preds = obj_preds_flat[pos_indices]  # [N_pos]
+                pos_obj_sigmoid = torch.sigmoid(pos_obj_preds)  # [N_pos]
+                
+                # Use simple BCE loss (not Focal Loss) for positive samples
+                # Target is 1.0 for all positive samples
+                recall_loss = -torch.log(pos_obj_sigmoid + 1e-6).sum()
+                recall_loss_weighted = recall_loss * self.recall_weight
+                total_loss = total_loss + recall_loss_weighted
+
+        # IoU loss (optional, only if iou_weight > 0)
+        iou_loss_weighted = 0.0
+        if self.iou_weight > 0 and positives.sum() > 0:
+            # Get anchor_box from target_dict or output_dict
+            anchor_box = target_dict.get("anchor_box", None)
+            if anchor_box is None:
+                anchor_box = output_dict.get("anchor_box", None)
+            if anchor_box is not None:
+                # Use positives mask (already flattened to [B, H*W*A])
+                pred_boxes = self._decode_delta_to_boxes(rm, anchor_box, positives)
+                gt_boxes = self._decode_delta_to_boxes(targets, anchor_box, positives)
+                
+                if pred_boxes.shape[0] > 0 and gt_boxes.shape[0] > 0 and pred_boxes.shape[0] == gt_boxes.shape[0]:
+                    # Calculate IoU - use mean (same as MambaFusion: sum then divide by num_pos)
+                    from opencood.utils.iou3d_nms import iou3d_nms_utils
+                    iou = iou3d_nms_utils.paired_boxes_iou3d_gpu(pred_boxes.float(), gt_boxes.float())
+                    num_pos = pred_boxes.shape[0]
+                    iou_loss = (1.0 - iou).sum() / max(num_pos, 1)
+                    iou_loss_weighted = iou_loss * self.iou_weight
+                    total_loss = total_loss + iou_loss_weighted
+
+        loss_dict_update = {
                 "total_loss{}".format(prefix): total_loss.item(),
                 "reg_loss{}".format(prefix): reg_loss.item(),
                 "conf_loss{}".format(prefix): conf_loss.item(),
-                # "obj_loss{}".format(prefix): obj_loss.item(),
+            "obj_loss{}".format(prefix): obj_loss_weighted.item(),
             }
-        )
+        # Always record recall_loss and iou_loss if weights are set, even if 0
+        if self.recall_weight > 0:
+            if isinstance(recall_loss_weighted, torch.Tensor):
+                loss_dict_update["recall_loss{}".format(prefix)] = recall_loss_weighted.item()
+            else:
+                loss_dict_update["recall_loss{}".format(prefix)] = float(recall_loss_weighted)
+        if self.iou_weight > 0:
+            if isinstance(iou_loss_weighted, torch.Tensor):
+                loss_dict_update["iou_loss{}".format(prefix)] = iou_loss_weighted.item()
+            else:
+                loss_dict_update["iou_loss{}".format(prefix)] = float(iou_loss_weighted)
+        self.loss_dict.update(loss_dict_update)
 
         return total_loss
 
@@ -313,6 +328,62 @@ class PointPillarLossMultiClass(nn.Module):
             + torch.log1p(torch.exp(-torch.abs(input)))
         )
         return loss
+
+    def _decode_delta_to_boxes(self, deltas, anchor_box, pos_mask):
+        """
+        Decode delta (relative to anchor) to absolute boxes.
+        
+        Args:
+            deltas: [B, H*W*A, 7] - delta values
+            anchor_box: [H, W, A, 7] or [H*W*A, 7] - anchor boxes
+            pos_mask: [B, H*W*A] - positive mask (bool)
+            
+        Returns:
+            boxes: [N_pos, 7] - decoded boxes for positive samples
+        """
+        B, N, _ = deltas.shape
+        device = deltas.device
+        
+        # Reshape anchor_box if needed
+        if anchor_box.dim() == 4:  # [H, W, A, 7]
+            anchor_box = anchor_box.view(-1, 7)  # [H*W*A, 7]
+        elif anchor_box.dim() == 3:  # [H, W, A] -> should not happen
+            anchor_box = anchor_box.view(-1, 7)
+        
+        anchor_box = anchor_box.to(device).float()
+        
+        # Get positive samples (flatten batch dimension)
+        pos_indices_flat = pos_mask.view(-1)  # [B*H*W*A]
+        if pos_indices_flat.sum() == 0:
+            return torch.empty((0, 7), device=device)
+        
+        # Flatten deltas and get positive samples
+        deltas_flat = deltas.view(-1, 7)  # [B*H*W*A, 7]
+        pos_deltas = deltas_flat[pos_indices_flat]  # [N_pos, 7]
+        pos_anchors = anchor_box[pos_indices_flat]  # [N_pos, 7]
+        
+        # Decode boxes (same logic as delta_to_boxes3d)
+        boxes = torch.zeros_like(pos_deltas)
+        
+        # Calculate anchor diagonal for x, y normalization
+        anchors_d = torch.sqrt(pos_anchors[:, 4] ** 2 + pos_anchors[:, 5] ** 2)  # [N_pos]
+        
+        # Decode x, y (normalized by anchor diagonal)
+        boxes[:, 0] = pos_deltas[:, 0] * anchors_d + pos_anchors[:, 0]
+        boxes[:, 1] = pos_deltas[:, 1] * anchors_d + pos_anchors[:, 1]
+        
+        # Decode z (normalized by anchor height)
+        boxes[:, 2] = pos_deltas[:, 2] * pos_anchors[:, 3] + pos_anchors[:, 2]
+        
+        # Decode h, w, l (exp scale)
+        boxes[:, 3] = torch.exp(pos_deltas[:, 3]) * pos_anchors[:, 3]  # h
+        boxes[:, 4] = torch.exp(pos_deltas[:, 4]) * pos_anchors[:, 4]  # w
+        boxes[:, 5] = torch.exp(pos_deltas[:, 5]) * pos_anchors[:, 5]  # l
+        
+        # Decode yaw (additive)
+        boxes[:, 6] = pos_deltas[:, 6] + pos_anchors[:, 6]
+        
+        return boxes
 
     @staticmethod
     def add_sin_difference(boxes1, boxes2, dim=6):

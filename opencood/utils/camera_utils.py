@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torchvision
 from PIL import Image
+from PIL import ImageEnhance
 from shapely.geometry import MultiPoint
 
 
@@ -34,6 +35,7 @@ def sample_augmentation(data_aug_conf, is_train):
     """
     H, W = data_aug_conf['H'], data_aug_conf['W']
     fH, fW = data_aug_conf['final_dim']
+    
     if is_train:
         resize = np.random.uniform(*data_aug_conf['resize_lim'])
         resize_dims = (int(W*resize), int(H*resize))
@@ -61,17 +63,22 @@ def sample_augmentation(data_aug_conf, is_train):
 
 def img_transform(imgs, post_rot, post_tran,
                   resize, resize_dims, crop,
-                  flip, rotate):
+                  flip, rotate, resample=None):
+    """
+    resample: PIL 插值方法，如 Image.NEAREST。None 表示使用 PIL 默认（语义标签图应传 NEAREST 避免插值产生越界类别）
+    """
     imgs_output = []
     for img in imgs:
         # adjust image
-        img = img.resize(resize_dims)
+        if resample is not None:
+            img = img.resize(resize_dims, resample=resample)
+        else:
+            img = img.resize(resize_dims)
         img = img.crop(crop)
         if flip:
             img = img.transpose(method=Image.FLIP_LEFT_RIGHT)
         img = img.rotate(rotate)
         imgs_output.append(img)
-
     # post-homography transformation
     post_rot *= resize
     post_tran -= torch.Tensor(crop[:2])
@@ -98,6 +105,172 @@ def get_rot(h):
             [-np.sin(h), np.cos(h)],
         ]
     )
+
+
+def _sample_uniform(value_range, default_value):
+    if value_range is None:
+        return default_value
+    if isinstance(value_range, (int, float)):
+        return float(value_range)
+    if len(value_range) == 1:
+        return float(value_range[0])
+    return float(np.random.uniform(value_range[0], value_range[1]))
+
+
+def sample_weather_augmentation(weather_aug_conf, is_train):
+    if not is_train or not weather_aug_conf:
+        return None
+
+    if not weather_aug_conf.get("enable", False):
+        return None
+
+    if np.random.rand() > weather_aug_conf.get("prob", 0.0):
+        return None
+
+    modes = weather_aug_conf.get("modes", [])
+    if not modes:
+        return None
+
+    mode = str(np.random.choice(modes)).lower()
+    state = {"mode": mode}
+
+    if mode == "night":
+        night_conf = weather_aug_conf.get("night", {})
+        blur_prob = night_conf.get("blur_prob", 0.0)
+        state.update(
+            {
+                "brightness_factor": _sample_uniform(
+                    night_conf.get("brightness_lim"), 0.45
+                ),
+                "contrast_factor": _sample_uniform(
+                    night_conf.get("contrast_lim"), 0.85
+                ),
+                "saturation_factor": _sample_uniform(
+                    night_conf.get("saturation_lim"), 0.75
+                ),
+                "gamma": _sample_uniform(night_conf.get("gamma_lim"), 2.0),
+                "noise_std": _sample_uniform(
+                    night_conf.get("noise_std_lim"), 0.02
+                ),
+                "blur_kernel": 0,
+            }
+        )
+        if np.random.rand() < blur_prob:
+            blur_kernel = int(
+                round(_sample_uniform(night_conf.get("blur_kernel_lim"), 3))
+            )
+            state["blur_kernel"] = max(1, blur_kernel) | 1
+        return state
+
+    if mode in ["fog", "haze"]:
+        fog_conf = weather_aug_conf.get("fog", {})
+        atmospheric_light = _sample_uniform(
+            fog_conf.get("atmospheric_light_lim"), 0.9
+        )
+        state.update(
+            {
+                "mode": "fog",
+                "beta": _sample_uniform(fog_conf.get("beta_lim"), 0.05),
+                "atmospheric_light": np.array(
+                    [atmospheric_light, atmospheric_light, atmospheric_light],
+                    dtype=np.float32,
+                ),
+                "desaturation_factor": _sample_uniform(
+                    fog_conf.get("desaturation_lim"), 0.85
+                ),
+                "blur_kernel": 0,
+            }
+        )
+        blur_prob = fog_conf.get("blur_prob", 0.0)
+        if np.random.rand() < blur_prob:
+            blur_kernel = int(
+                round(_sample_uniform(fog_conf.get("blur_kernel_lim"), 3))
+            )
+            state["blur_kernel"] = max(1, blur_kernel) | 1
+        return state
+
+    return None
+
+
+def _pil_depth_to_numpy_meters(pil_depth):
+    if pil_depth.mode == "I;16":
+        depth_scaled = np.array(pil_depth, dtype=np.float32)
+        return depth_scaled * 1000.0 / 65535.0
+    return np.array(pil_depth, dtype=np.float32)
+
+
+def _apply_night_augmentation(image, weather_state):
+    image = ImageEnhance.Brightness(image).enhance(
+        weather_state["brightness_factor"]
+    )
+    image = ImageEnhance.Contrast(image).enhance(
+        weather_state["contrast_factor"]
+    )
+    image = ImageEnhance.Color(image).enhance(
+        weather_state["saturation_factor"]
+    )
+
+    image_np = np.asarray(image, dtype=np.float32) / 255.0
+    image_np = np.power(np.clip(image_np, 0.0, 1.0), weather_state["gamma"])
+
+    blur_kernel = weather_state.get("blur_kernel", 0)
+    if blur_kernel > 1:
+        image_np = cv2.GaussianBlur(image_np, (blur_kernel, blur_kernel), 0)
+
+    noise_std = weather_state.get("noise_std", 0.0)
+    if noise_std > 0:
+        noise = np.random.normal(0.0, noise_std, size=image_np.shape)
+        image_np = image_np + noise.astype(np.float32)
+
+    image_np = np.clip(image_np, 0.0, 1.0)
+    return Image.fromarray((image_np * 255.0).astype(np.uint8))
+
+
+def _build_fog_transmission(depth_map, beta):
+    transmission = np.exp(-beta * depth_map)
+    transmission = np.clip(transmission, 0.15, 1.0)
+    return transmission[..., None]
+
+
+def _apply_fog_augmentation(image, weather_state, depth_image=None):
+    image_np = np.asarray(image, dtype=np.float32) / 255.0
+
+    if depth_image is not None:
+        depth_map = _pil_depth_to_numpy_meters(depth_image)
+        transmission = _build_fog_transmission(depth_map, weather_state["beta"])
+    else:
+        height, width = image_np.shape[:2]
+        vertical = np.linspace(0.35, 1.0, height, dtype=np.float32).reshape(height, 1)
+        transmission = np.repeat(vertical, width, axis=1)[..., None]
+
+    atmosphere = weather_state["atmospheric_light"].reshape(1, 1, 3)
+    image_np = image_np * transmission + atmosphere * (1.0 - transmission)
+
+    desaturation = weather_state.get("desaturation_factor", 1.0)
+    gray = image_np.mean(axis=2, keepdims=True)
+    image_np = gray * (1.0 - desaturation) + image_np * desaturation
+
+    blur_kernel = weather_state.get("blur_kernel", 0)
+    if blur_kernel > 1:
+        image_np = cv2.GaussianBlur(image_np, (blur_kernel, blur_kernel), 0)
+
+    image_np = np.clip(image_np, 0.0, 1.0)
+    return Image.fromarray((image_np * 255.0).astype(np.uint8))
+
+
+def apply_weather_augmentation(image, weather_state, depth_image=None):
+    if weather_state is None:
+        return image
+
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    mode = weather_state.get("mode")
+    if mode == "night":
+        return _apply_night_augmentation(image, weather_state)
+    if mode == "fog":
+        return _apply_fog_augmentation(image, weather_state, depth_image)
+    return image
 
 
 class NormalizeInverse(torchvision.transforms.Normalize):

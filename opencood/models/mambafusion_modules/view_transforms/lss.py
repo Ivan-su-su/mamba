@@ -33,42 +33,75 @@ class LSSTransform_Lite(nn.Module):
             self.create_grid_infos(**self.grid_config)
             self.collapse_z = model_cfg.get('collapse_z', True)
         if self.use_mamba:
-            self.x_coord = None
-            self.bev_size = model_cfg.get('BEV_SIZE', 360)
-            self.shape_inter = [1, self.bev_size, self.bev_size]
-            self.hilbert_config = {#'curve_template_path_rank10': '../ckpts/hilbert_template/curve_template_3d_rank_10.pth', 
-                                   'curve_template_path_rank9': '../ckpts/hilbert_template/curve_template_3d_rank_9.pth', 
-                                   'curve_template_path_rank8': '../ckpts/hilbert_template/curve_template_3d_rank_8.pth', 
-                                   'curve_template_path_rank7': '../ckpts/hilbert_template/curve_template_3d_rank_7.pth'}
-            # self.hilbert_spatial_sis
+            self.x_coord = None  # 所有agent共用，因为BEV尺寸都是[200, 704]
+            # 支持矩形输入：如果提供了 BEV_SIZE_H 和 BEV_SIZE_W，使用它们；否则使用 BEV_SIZE（向后兼容）
+            if 'BEV_SIZE_H' in model_cfg and 'BEV_SIZE_W' in model_cfg:
+                self.bev_size_H = model_cfg.get('BEV_SIZE_H', 200)
+                self.bev_size_W = model_cfg.get('BEV_SIZE_W', 704)
+            else:
+                # 向后兼容：如果只提供了 BEV_SIZE，假设是正方形
+                self.bev_size_H = model_cfg.get('BEV_SIZE', 360)
+                self.bev_size_W = model_cfg.get('BEV_SIZE', 360)
+            self.shape_inter = [1, self.bev_size_H, self.bev_size_W]
+            # 为矩形BEV (200x704) 配置Hilbert模板
+            # max(200, 704) = 704 < 1024 = 2^10, 所以需要rank10来覆盖原始尺寸
+            # 下采样后(100x352): max(100, 352) = 352 < 512 = 2^9, 所以需要rank9来覆盖
+            self.hilbert_config = {
+                'curve_template_path_rank10': '/mnt/home/suyi/AirV2X-Perception_copy/opencood/models/mambafusion_modules/ckpts/hilbert_template/curve_template_3d_rank_10.pth',
+                'curve_template_path_rank9': '/mnt/home/suyi/AirV2X-Perception_copy/opencood/models/mambafusion_modules/ckpts/hilbert_template/curve_template_3d_rank_9.pth', 
+                'curve_template_path_rank8': '/mnt/home/suyi/AirV2X-Perception_copy/opencood/models/mambafusion_modules/ckpts/hilbert_template/curve_template_3d_rank_8.pth', 
+                'curve_template_path_rank7': '/mnt/home/suyi/AirV2X-Perception_copy/opencood/models/mambafusion_modules/ckpts/hilbert_template/curve_template_3d_rank_7.pth'
+            }
             self.curve_template = {}
             self.template_on_device = False
             self.hilbert_spatial_size = {}
-            # self.load_template('../ckpts/hilbert_template/curve_template_3d_rank_10.pth', 9)
-            self.load_template('/home/chubin/suyi/AirV2X-Perception/opencood/models/mambafusion_modules/ckpts/hilbert_template/curve_template_3d_rank_9.pth', 9)
-            self.load_template('/home/chubin/suyi/AirV2X-Perception/opencood/models/mambafusion_modules/ckpts/hilbert_template/curve_template_3d_rank_8.pth', 8)
-            self.load_template('/home/chubin/suyi/AirV2X-Perception/opencood/models/mambafusion_modules/ckpts/hilbert_template/curve_template_3d_rank_7.pth', 7)
+            # 加载rank10模板用于覆盖200x704的BEV尺寸
+            self.load_template('/mnt/home/suyi/AirV2X-Perception_copy/opencood/models/mambafusion_modules/ckpts/hilbert_template/curve_template_3d_rank_10.pth', 10)
+            self.load_template('/mnt/home/suyi/AirV2X-Perception_copy/opencood/models/mambafusion_modules/ckpts/hilbert_template/curve_template_3d_rank_9.pth', 9)
+            self.load_template('/mnt/home/suyi/AirV2X-Perception_copy/opencood/models/mambafusion_modules/ckpts/hilbert_template/curve_template_3d_rank_8.pth', 8)
+            self.load_template('/mnt/home/suyi/AirV2X-Perception_copy/opencood/models/mambafusion_modules/ckpts/hilbert_template/curve_template_3d_rank_7.pth', 7)
+            
             self.mamba_downsample_scale = model_cfg.get('MAMBA_DOWNSAMPLE_SCALE', 1)
+            
+            # 检查Hilbert曲线模板尺寸与BEV尺寸的匹配
             self.mamba_layernorm = nn.LayerNorm(out_channel)
-            self.mamba_layernorm2 = nn.LayerNorm(64)
+            self.mamba_layernorm2 = nn.LayerNorm(128)
             self.mamba_blocks = nn.ModuleList()
+            # 根据BEV尺寸选择合适的Hilbert模板
+            # 对于200x704: 原始使用rank10 (1024x1024), 下采样后使用rank9 (512x512)
+            # 对于360x360: 原始使用rank9 (512x512), 下采样后使用rank8 (256x256)
+            max_bev_dim = max(self.bev_size_H, self.bev_size_W)
+            if max_bev_dim > 512:
+                downsample_ori_template = 'curve_template_rank10'
+                downsample_lvl_template = 'curve_template_rank9'
+            elif max_bev_dim > 256:
+                downsample_ori_template = 'curve_template_rank9'
+                downsample_lvl_template = 'curve_template_rank8'
+            else:
+                downsample_ori_template = 'curve_template_rank8'
+                downsample_lvl_template = 'curve_template_rank7'
+            
+            print(f"[LSSTransform] BEV size: ({self.bev_size_H}, {self.bev_size_W}), using {downsample_ori_template} as ori, {downsample_lvl_template} as lvl")
+            
             for i in range(1):
                 if self.use_multi_block:
-                    local_block = LocalMamba(dim=64, depth=2, down_scales=[[2, 2, 1], [2, 2, 1]], window_shape=[13, 13, 1], group_size=128, direction=['x', 'y'], shift=True,
+                    local_block = LocalMamba(dim=128, depth=2, down_scales=[[2, 2, 1], [2, 2, 1]], window_shape=[13, 13, 1], group_size=128, direction=['x', 'y'], shift=True,
                                 operator=EasyDict({'NAME': 'Mamba', 'CFG': {'d_state': 16, 'd_conv': 4, 'expand': 2, 'drop_path': 0.2}}),layer_id=0, n_layer=34)
-                    global_block = GlobalMamba(64, ssm_cfg=None, norm_epsilon=1e-05, rms_norm=True, 
+                    global_block = GlobalMamba(128, ssm_cfg=None, norm_epsilon=1e-05, rms_norm=True, 
                         down_kernel_size=[3, 3], down_stride=[1, 2], num_down=[0, 1], 
                         norm_fn=partial(nn.BatchNorm1d, eps=1e-3, momentum=0.01), indice_key='stem0_layer0', sparse_shape=self.shape_inter, hilbert_config=self.hilbert_config,
-                        downsample_lvl='curve_template_rank8',
+                        downsample_ori=downsample_ori_template,
+                        downsample_lvl=downsample_lvl_template,
                         down_resolution=True, residual_in_fp32=True, fused_add_norm=True, 
                         device='cuda', dtype=torch.float32)
                     self.mamba_blocks.append(local_block)
                     self.mamba_blocks.append(global_block)
                 else:
-                    global_block = GlobalMamba(64, ssm_cfg=None, norm_epsilon=1e-05, rms_norm=True, 
+                    global_block = GlobalMamba(128, ssm_cfg=None, norm_epsilon=1e-05, rms_norm=True, 
                         down_kernel_size=[3, 3], down_stride=[1, 2], num_down=[0, 1], 
                         norm_fn=partial(nn.BatchNorm1d, eps=1e-3, momentum=0.01), indice_key='stem0_layer0', sparse_shape=self.shape_inter, hilbert_config=self.hilbert_config,
-                        downsample_lvl='curve_template_rank8',
+                        downsample_ori=downsample_ori_template,
+                        downsample_lvl=downsample_lvl_template,
                         down_resolution=True, residual_in_fp32=True, fused_add_norm=True, 
                         device='cuda', dtype=torch.float32)
                     self.mamba_blocks.append(global_block)
@@ -76,7 +109,7 @@ class LSSTransform_Lite(nn.Module):
                 assert self.mamba_downsample_scale == 2 or self.mamba_downsample_scale == 4, self.mamba_downsample_scale
                 if self.mamba_downsample_scale == 2:
                     self.sub_dim = nn.Sequential(
-                        nn.Conv2d(64, out_channel, 3, padding=1, bias=False),
+                        nn.Conv2d(128, out_channel, 3, padding=1, bias=False),
                         nn.BatchNorm2d(out_channel),
                         nn.ReLU(),
                         nn.ConvTranspose2d(out_channel, out_channel, 3, stride=self.mamba_downsample_scale, padding=1, output_padding=1, bias=False),
@@ -85,7 +118,7 @@ class LSSTransform_Lite(nn.Module):
                     )
                 else:
                     self.sub_dim = nn.Sequential(
-                        nn.Conv2d(64, out_channel, 3, padding=1, bias=False),
+                        nn.Conv2d(128, out_channel, 3, padding=1, bias=False),
                         nn.BatchNorm2d(out_channel),
                         nn.ReLU(),
                         nn.ConvTranspose2d(out_channel, out_channel, 3, stride=2, padding=1, output_padding=1, bias=False),
@@ -103,7 +136,7 @@ class LSSTransform_Lite(nn.Module):
                     )
             else:
                 self.sub_dim = nn.Sequential(
-                    nn.Conv2d(64, out_channel, 3, padding=1, bias=False),
+                    nn.Conv2d(128, out_channel, 3, padding=1, bias=False),
                     nn.BatchNorm2d(out_channel),
                     nn.ReLU(),
                     nn.Conv2d(out_channel, out_channel, 3, padding=1, bias=False),
@@ -114,7 +147,7 @@ class LSSTransform_Lite(nn.Module):
                 nn.Linear(9, 128),
                 nn.BatchNorm1d(128),
                 nn.ReLU(inplace=True),
-                nn.Linear(128, 64),
+                nn.Linear(128, 128),
                 )
             # out_channel = 128
             if self.mamba_downsample_scale > 1:
@@ -133,8 +166,8 @@ class LSSTransform_Lite(nn.Module):
                         ),
                         nn.BatchNorm2d(128),
                         nn.ReLU(True),
-                        nn.Conv2d(128, 64, 3, padding=1, bias=False),
-                        nn.BatchNorm2d(64), #TODO: 修改为64
+                        nn.Conv2d(128, 128, 3, padding=1, bias=False),
+                        nn.BatchNorm2d(128),
                         nn.ReLU(True),
                     )
                 else:
@@ -157,13 +190,13 @@ class LSSTransform_Lite(nn.Module):
                         nn.ReLU(True),
                         nn.Conv2d(
                             128,
-                            64,
+                            128,
                             3,
                             stride=2,
                             padding=1,
                             bias=False,
                         ),
-                        nn.BatchNorm2d(64), #TODO: 修改为64
+                        nn.BatchNorm2d(128),
                         nn.ReLU(True),
                     )
 
@@ -172,8 +205,8 @@ class LSSTransform_Lite(nn.Module):
                     nn.Conv2d(out_channel, 128, 3, padding=1, bias=False),
                     nn.BatchNorm2d(128),
                     nn.ReLU(True),
-                    nn.Conv2d(128, 64, 3, padding=1, bias=False),
-                    nn.BatchNorm2d(64), #TODO: 修改为64
+                    nn.Conv2d(128, 128, 3, padding=1, bias=False),
+                    nn.BatchNorm2d(128),
                     nn.ReLU(True),
                 )
         self.image_size = self.model_cfg.IMAGE_SIZE
@@ -181,22 +214,32 @@ class LSSTransform_Lite(nn.Module):
         xbound = self.model_cfg.XBOUND
         ybound = self.model_cfg.YBOUND
         zbound = self.model_cfg.ZBOUND
-        self.dbound = self.model_cfg.DBOUND
+        self.dbound_list = self.model_cfg.DBOUND
+        self.xbound_veh,self.xbound_rsu,self.xbound_drone = xbound[0],xbound[1],xbound[2]
+        self.ybound_veh,self.ybound_rsu,self.ybound_drone = ybound[0],ybound[1],ybound[2]
+        self.zbound_veh,self.zbound_rsu,self.zbound_drone = zbound[0],zbound[1],zbound[2]
+        
+       
         downsample = self.model_cfg.DOWNSAMPLE
         self.accelerate = self.model_cfg.get("ACCELERATE",False)
         if self.accelerate:
             self.cache = None
 
-        dx, bx, nx = gen_dx_bx(xbound, ybound, zbound)
+        dx_veh, bx_veh, nx_veh = gen_dx_bx(self.xbound_veh, self.ybound_veh, self.zbound_veh)
+        dx_rsu, bx_rsu, nx_rsu = gen_dx_bx(self.xbound_rsu, self.ybound_rsu, self.zbound_rsu)
+        dx_drone, bx_drone, nx_drone = gen_dx_bx(self.xbound_drone, self.ybound_drone, self.zbound_drone)
+        dx = torch.stack([dx_veh, dx_rsu, dx_drone], dim=0)
+        bx = torch.stack([bx_veh, bx_rsu, bx_drone], dim=0)
+        nx = torch.stack([nx_veh, nx_rsu, nx_drone], dim=0)
         self.dx = nn.Parameter(dx, requires_grad=False)
         self.bx = nn.Parameter(bx, requires_grad=False)
         self.nx = nn.Parameter(nx, requires_grad=False)
-        
+        self.agent_list = {'vehicle':0, 'rsu':1, 'drone':2}
         self.C = out_channel
-        self.frustum = self.create_frustum()
-        self.D = self.frustum.shape[0]
+        self.frustum_list = self.create_frustum()
+        self.D_list = [frustum.shape[0] for frustum in self.frustum_list]
         self.fp16_enabled = False
-        self.depthnet = nn.Conv2d(in_channel, self.D + self.C, 1)
+        self.depthnet_list = nn.ModuleList([nn.Conv2d(in_channel, D + self.C, 1) for D in self.D_list])
         self.with_depth_from_lidar = model_cfg.get('with_depth_from_lidar', False)
         if self.with_depth_from_lidar:
             self.lidar_input_net = nn.Sequential(
@@ -290,10 +333,12 @@ class LSSTransform_Lite(nn.Module):
             self.curve_template[f'curve_template_rank{rank}'] = template.reshape(-1)
             spatial_size = 2 ** rank
             self.hilbert_spatial_size[f'curve_template_rank{rank}'] = (1, spatial_size, spatial_size) #[z, y, x]
+    
     def get_cam_feats(self, x, depth=None):
         x = x.to(torch.float)
         B, N, C, fH, fW = x.shape
-
+        self.depthnet = self.depthnet_list[self.agent_list[self.agent]]
+        self.D = self.D_list[self.agent_list[self.agent]]
         x = x.view(B * N, C, fH, fW)
         if self.with_depth_from_lidar:
             depth_from_lidar = depth
@@ -309,6 +354,7 @@ class LSSTransform_Lite(nn.Module):
             x = self.depthnet(x) 
         else:
             x = self.depthnet(x) # [6, 256, 32, 88] -> [6, 246, 32, 88]
+       
         depth = x[:, : self.D].softmax(dim=1) # [6, 118, 32, 88]
         x = depth.unsqueeze(1) * x[:, self.D : (self.D + self.C)].unsqueeze(2) # [6, 80, 118, 32, 88]
 
@@ -335,43 +381,47 @@ class LSSTransform_Lite(nn.Module):
     def create_frustum(self):
         iH, iW = self.image_size
         fH, fW = self.feature_size
-
-        ds = (
-            torch.arange(*self.dbound, dtype=torch.float)
-            .view(-1, 1, 1)
-            .expand(-1, fH, fW)
-        )
-        D, _, _ = ds.shape
-
-        xs = (
-            torch.linspace(0, iW - 1, fW, dtype=torch.float)
-            .view(1, 1, fW)
-            .expand(D, fH, fW)
-        )
-        ys = (
-            torch.linspace(0, iH - 1, fH, dtype=torch.float)
-            .view(1, fH, 1)
-            .expand(D, fH, fW)
-        )
-
-        frustum = torch.stack((xs, ys, ds), -1)
-        return nn.Parameter(frustum, requires_grad=False)
+        ds_list, xs_list, ys_list = [], [], []   
+       
+        for dbound in self.dbound_list:
+            ds = (
+                torch.arange(*dbound, dtype=torch.float)
+                .view(-1, 1, 1)
+                .expand(-1, fH, fW)
+            )  
+                    
+            D, _, _ = ds.shape
+            xs = (
+                torch.linspace(0, iW - 1, fW, dtype=torch.float)
+                .view(1, 1, fW)
+                .expand(D, fH, fW)
+            )
+            ys = (
+                torch.linspace(0, iH - 1, fH, dtype=torch.float)
+                .view(1, fH, 1)
+                .expand(D, fH, fW)
+            )
+            ds_list.append(ds)
+            xs_list.append(xs)
+            ys_list.append(ys)
+        frustums = [torch.stack((xs, ys, ds), -1) for xs, ys, ds in zip(xs_list, ys_list, ds_list)]
+        frustum_list = [nn.Parameter(frustum, requires_grad=False) for frustum in frustums]
+        return frustum_list
 
     def get_geometry(
         self,
-        lidar2img,
+        image2lidar_cam,
         img_aug_matrix
     ):
-        lidar2img = lidar2img.to(torch.float)
+        self.frustum = self.frustum_list[self.agent_list[self.agent]]
+        image2lidar_cam = image2lidar_cam.to(torch.float)
         img_aug_matrix = img_aug_matrix.to(torch.float)
-
-        B,N = lidar2img.shape[:2]
+        B,N = image2lidar_cam.shape[:2]
         D,H,W = self.frustum.shape[:3] # [118, 32, 88]
-        points = self.frustum.view(1,1,D,H,W,3).repeat(B,N,1,1,1,1) # [2, 6, 118, 32, 88, 3]
-
+        points = self.frustum.view(1,1,D,H,W,3).repeat(B,N,1,1,1,1).to(device=image2lidar_cam.device) # [1, 30, 118, 32, 88, 3]
         # undo post-transformation
         # B x N x D x H x W x 3
-        points = torch.cat([points,torch.ones_like(points[...,-1:])],dim=-1) # [2, 6, 118, 32, 88, 4] 变成齐次坐标
+        points = torch.cat([points,torch.ones_like(points[...,-1:])],dim=-1) # [1, 30, 118, 32, 88, 4] 变成齐次坐标
         points = torch.inverse(img_aug_matrix).view(B,N,1,1,1,4,4).matmul(points.unsqueeze(-1))
         # cam_to_lidar
         points = torch.cat(
@@ -382,52 +432,71 @@ class LSSTransform_Lite(nn.Module):
             ),
             5,
         )
-        points = torch.inverse(lidar2img).view(B,N,1,1,1,4,4).matmul(points).squeeze(-1)[...,:3] # [2, 6, 118, 32, 88, 3]
+        
+        points = image2lidar_cam.view(B,N,1,1,1,4,4).matmul(points).squeeze(-1)[...,:3] # [2, 6, 118, 32, 88, 3]
+        p = points[0,0].reshape(-1,3)
 
         return points
 
     def bev_pool(self, geom_feats, x):
-        geom_feats = geom_feats.to(torch.float) # [2, 6, 118, 32, 88, 3]
-        x = x.to(torch.float) # [2, 6, 118, 32, 88, 80]
+        bx = self.bx[self.agent_list[self.agent]]
+        dx = self.dx[self.agent_list[self.agent]]
+        nx = self.nx[self.agent_list[self.agent]]
+        geom_feats = geom_feats.to(torch.float)   # [B,N,D,H,W,3] float in meters
+        x = x.to(torch.float)                     # [B,N,D,H,W,C]
 
         B, N, D, H, W, C = x.shape
         Nprime = B * N * D * H * W
 
         # flatten x
-        x = x.reshape(Nprime, C) # [2*6*118*32*88, 80]
+        x = x.reshape(Nprime, C)
 
-        # flatten indices
-        geom_feats = ((geom_feats - (self.bx - self.dx / 2.0)) / self.dx).long()
-        geom_feats = geom_feats.view(Nprime, 3)
+        # -------- DEBUG (continuous xyz) --------
+        # flatten continuous points BEFORE discretization
+        geom_f = geom_feats.reshape(Nprime, 3)
+        # float voxel coords (not rounded)
+        idx_f = (geom_f - (bx - dx / 2.0)) / dx
+        # discretize
+        geom_i = idx_f.long()   # [Nprime,3]
+
+        # batch indices
         batch_ix = torch.cat(
-            [
-                torch.full([Nprime // B, 1], ix, device=x.device, dtype=torch.long)
-                for ix in range(B)
-            ]
-        )
-        geom_feats = torch.cat((geom_feats, batch_ix), 1)
+            [torch.full((Nprime // B, 1), ix, device=x.device, dtype=torch.long)
+            for ix in range(B)],
+            dim=0
+        )                       # [Nprime,1]
 
-        # filter out points that are outside box
+        geom_b = torch.cat((geom_i, batch_ix), dim=1)  # [Nprime,4]
+
+        # -------- kept computed on geom_i (xyz only) --------
         kept = (
-            (geom_feats[:, 0] >= 0)
-            & (geom_feats[:, 0] < self.nx[0])
-            & (geom_feats[:, 1] >= 0)
-            & (geom_feats[:, 1] < self.nx[1])
-            & (geom_feats[:, 2] >= 0)
-            & (geom_feats[:, 2] < self.nx[2])
+            (geom_i[:, 0] >= 0) & (geom_i[:, 0] < nx[0]) &
+            (geom_i[:, 1] >= 0) & (geom_i[:, 1] < nx[1]) &
+            (geom_i[:, 2] >= 0) & (geom_i[:, 2] < nx[2])
         )
+        # filter
         x = x[kept]
-        geom_feats = geom_feats[kept]
-        if self.accelerate and self.cache is None:
-            self.cache = (geom_feats,kept)
+        geom_b = geom_b[kept]
 
-        x = bev_pool(x, geom_feats, B, self.nx[2], self.nx[0], self.nx[1])
+        # ---- important: handle empty (avoid CUDA invalid config) ----
+        if x.shape[0] == 0:
+            # expected output shape [B,C,ny,nx] after your final permute
+            return x.new_zeros((B, C, int(nx[1]), int(nx[0])))
+
+        # cache for accelerate (store geom_b, kept)
+        if self.accelerate and self.cache is None:
+            self.cache = (geom_b, kept)
+
+        # CUDA pool expects coords [Nkept,4] (x,y,z,b)
+        x = bev_pool(x, geom_b, B, nx[2], nx[0], nx[1])
 
         # collapse Z
         final = torch.cat(x.unbind(dim=2), 1)
 
-        
+        # [B,C,nx,ny] -> [B,C,ny,nx]
+        final = final.permute(0, 1, 3, 2).contiguous()
         return final
+
 
     def acc_bev_pool(self,x):
         geom_feats,kept = self.cache
@@ -445,6 +514,9 @@ class LSSTransform_Lite(nn.Module):
         # collapse Z
         final = torch.cat(x.unbind(dim=2), 1)
 
+        # 修正空间维度顺序：bev_pool返回[B,C,nx,ny]，需要转换为[B,C,ny,nx]以匹配后续逻辑
+        # 最终输出需要是[B,C,H=200,W=704]格式
+        final = final.permute(0, 1, 3, 2).contiguous()
         
         return final
     
@@ -535,53 +607,30 @@ class LSSTransform_Lite(nn.Module):
     
     def forward(self, batch_dict, agent=None):
         def ensure_cam_mats(a_dict):
-            if ('lidar2image' in a_dict) and ('img_aug_matrix' in a_dict):
-                return a_dict['lidar2image'], a_dict['img_aug_matrix']
-            if 'batch_merged_cam_inputs' in a_dict:
-                cams = a_dict['batch_merged_cam_inputs']
-                imgs = cams['imgs']
-                Ks = cams['intrinsics']
-                Ext = cams['extrinsics']
-                post_rots = cams.get('post_rots', None)
-                post_trans = cams.get('post_trans', None)
-                Bc, Nc = imgs.shape[:2]
-                device = imgs.device
-                if Ks.shape[-2:] == (3, 3):
-                    Ks4 = torch.eye(4, device=device).view(1, 1, 4, 4).repeat(Bc, Nc, 1, 1)
-                    Ks4[:, :, :3, :3] = Ks
-                else:
-                    Ks4 = Ks
-                if Ext.shape[-2:] != (4, 4):
-                    raise ValueError('Extrinsics must be 4x4')
-                # assume extrinsics are lidar->cam if flagged, else invert
-                flag = a_dict.get('EXTRINSICS_IS_LIDAR_TO_CAM', False)
-                T_cam_lidar = Ext if flag else torch.inverse(Ext)
-                lidar2image = torch.matmul(Ks4, T_cam_lidar)
-                if post_rots is not None and post_trans is not None:
-                    aug = torch.eye(4, device=device).view(1, 1, 4, 4).repeat(Bc, Nc, 1, 1)
-                    aug[:, :, :3, :3] = post_rots
-                    aug[:, :, :3, 3] = post_trans
-                else:
-                    aug = torch.eye(4, device=device).view(1, 1, 4, 4).repeat(Bc, Nc, 1, 1)
-                a_dict['lidar2image'] = lidar2image
-                a_dict['img_aug_matrix'] = aug
-                return lidar2image, aug
-            raise KeyError('Missing lidar2image/img_aug_matrix and no batch_merged_cam_inputs present')
+            if ('lidar2image_cam' in a_dict) and ('img_aug_matrix' in a_dict):
+                if ('agent_to_ego_transform' in a_dict):
+                    agent_to_ego = a_dict['agent_to_ego_transform']  # [B, 4, 4]
+                    image2lidar_cam = torch.matmul(agent_to_ego,torch.inverse(a_dict['lidar2image_cam']) )
+                    # image2lidar_cam = torch.inverse(a_dict['lidar2image_cam']) #TODO it seems this way is better
+                return image2lidar_cam, a_dict['img_aug_matrix']
+            else:
+                raise KeyError('Missing lidar2image/img_aug_matrix and no batch_merged_cam_inputs present')
 
         def process_single_agent(agent_dict, agent_name):
             """处理单个智能体的vtransform"""
-            x = agent_dict['image_fpn'] 
+            # 检查Mamba状态：确保每个agent使用独立的状态
+            # 注意：GlobalMamba和LocalMamba本身是无状态的（每次forward都是独立的）
+            # 但x_coord缓存可能在不同agent间共享，需要检查
+            image2lidar_cam, img_aug_matrix = ensure_cam_mats(agent_dict)
+            x = agent_dict['image_fpn']
             if not isinstance(x, torch.Tensor):
                 x = x[0]
 
-            BN, C, H, W = x.size()
+            BN, C, H, W = x.size()   #[BN, 256, 32, 88]
             # infer views from lidar2image when available
-            if 'lidar2image' in agent_dict:
-                N = int(agent_dict['lidar2image'].shape[1])
-            elif 'camera_imgs' in agent_dict:
-                N = int(agent_dict['camera_imgs'].shape[1])
-            else:
-                N = 6
+            
+            N = int(image2lidar_cam.shape[1])
+           
             B = BN // N
             img = x.view(B, N, C, H, W)
             
@@ -593,16 +642,12 @@ class LSSTransform_Lite(nn.Module):
                 if self.with_depth_from_lidar and 'gt_depth' in agent_dict:
                     x = self.get_cam_feats(img, agent_dict['gt_depth'])
                 else:
-                    x = self.get_cam_feats(img)
+                    x = self.get_cam_feats(img)   #this one
             
             if self.accelerate and self.cache is not None: 
                 x = self.acc_bev_pool(x)
-            else:
-                img_aug_matrix = agent_dict['img_aug_matrix']
-                lidar2image = agent_dict['lidar2image']
-                if self.training and 'lidar2image_aug' in agent_dict:
-                    lidar2image = agent_dict['lidar2image_aug']
-                geom = self.get_geometry(lidar2image, img_aug_matrix)
+            else:               
+                geom = self.get_geometry(image2lidar_cam, img_aug_matrix)
                 if self.use_pool_v2:
                     x = self.voxel_pooling_v2(geom, depth, x)
                 else:
@@ -618,23 +663,48 @@ class LSSTransform_Lite(nn.Module):
                             self.curve_template[name] = self.curve_template[name].to(x.device)
                 x_down = self.mamba_downsample(x)
 
-                x_down = x_down.permute(0,2,3,1).contiguous() # [2, 360, 360, 80]
+                x_down = x_down.permute(0,2,3,1).contiguous() # [batch_size, H_down, W_down, channels]
+                # TODO: 在AirV2X中，x的第一维表示相机视角，batch_size都是等于1，需要确认后续逻辑如何处理这个第一维信息
                 batch_size = x_down.size(0)
-                # [2, 360 * 360, 80]
+                # [batch_size * H_down * W_down, channels]
                 x_down = x_down.reshape(-1, x_down.size(-1))
-                # 生成[360, 360, 2]的坐标
-                feature_map_size = self.bev_size // self.mamba_downsample_scale
                 
-                # 按照原始MambaFusion的方式生成坐标，使用固定的360x360网格
-                # 注意：这里仍然使用360x360，因为后续会resize到200x704
-                x_coord = torch.stack(torch.meshgrid([torch.arange(0, feature_map_size), torch.arange(0, feature_map_size)]), dim=-1).reshape(-1, 2)
-                x_coord = torch.cat([torch.zeros_like(x_coord[..., :1]), torch.zeros_like(x_coord[..., :1]), x_coord], dim=-1)
-                x_coord = x_coord * self.mamba_downsample_scale  # 缩放到原始尺寸
-                x_coord = x_coord.repeat(batch_size, 1, 1)
-                for batch_idx in range(batch_size):
-                    x_coord[batch_idx, :, 0] = batch_idx
-                x_coord = x_coord.reshape(-1, x_coord.size(-1)).to(x.device)
+                # 生成坐标，根据bev_size和mamba_downsample_scale计算feature_map_size（与参考代码逻辑一致）
+                feature_map_size_H = self.bev_size_H // self.mamba_downsample_scale
+                feature_map_size_W = self.bev_size_W // self.mamba_downsample_scale
                 
+                # 使用缓存机制，只在第一次生成坐标
+                # 所有agent共用x_coord，因为BEV尺寸都是[200, 704]
+                if self.x_coord is None:
+                    x_coord = torch.stack(torch.meshgrid([
+                        torch.arange(0, feature_map_size_H, device=x.device, dtype=torch.float32),
+                        torch.arange(0, feature_map_size_W, device=x.device, dtype=torch.float32)
+                    ], indexing='ij'), dim=-1).reshape(-1, 2)
+                    x_coord = torch.cat([torch.zeros_like(x_coord[..., :1]), torch.zeros_like(x_coord[..., :1]), x_coord], dim=-1)
+                    x_coord = x_coord * self.mamba_downsample_scale  # 缩放到原始BEV尺寸
+                    x_coord = x_coord.repeat(batch_size, 1, 1)
+                    for batch_idx in range(batch_size):
+                        x_coord[batch_idx, :, 0] = batch_idx
+                    x_coord = x_coord.reshape(-1, x_coord.size(-1)).to(x.device)
+                    self.x_coord = x_coord
+                else:
+                    x_coord = self.x_coord
+                    # 如果batch_size变化，需要调整batch索引
+                    if x_coord.shape[0] // (feature_map_size_H * feature_map_size_W) != batch_size:
+                        # 重新生成以适应新的batch_size
+                        x_coord = torch.stack(torch.meshgrid([
+                            torch.arange(0, feature_map_size_H, device=x.device, dtype=torch.float32),
+                            torch.arange(0, feature_map_size_W, device=x.device, dtype=torch.float32)
+                        ], indexing='ij'), dim=-1).reshape(-1, 2)
+                        x_coord = torch.cat([torch.zeros_like(x_coord[..., :1]), torch.zeros_like(x_coord[..., :1]), x_coord], dim=-1)
+                        x_coord = x_coord * self.mamba_downsample_scale
+                        x_coord = x_coord.repeat(batch_size, 1, 1)
+                        for batch_idx in range(batch_size):
+                            x_coord[batch_idx, :, 0] = batch_idx
+                        x_coord = x_coord.reshape(-1, x_coord.size(-1)).to(x.device)
+                        self.x_coord = x_coord
+               
+                # 如果形状不匹配，截断x_coord（与参考代码一致）
                 if x_coord.shape[0] != x_down.shape[0]:
                     x_coord = x_coord[:x_down.shape[0]]
                     print(f"  调整后x_coord.shape: {x_coord.shape}")
@@ -669,7 +739,7 @@ class LSSTransform_Lite(nn.Module):
                         for block in self.mamba_blocks:
                             new_x, _ = block(new_x, new_coord, agent_dict.get('batch_size', 1), self.shape_inter,
                                                     self.curve_template, self.hilbert_spatial_size, self.pos_embed_inter, 0, False)
-                    x_down = new_x[num_pillars:].reshape(batch_size, feature_map_size, feature_map_size, -1).permute(0, 3, 1, 2).contiguous()
+                    x_down = new_x[num_pillars:].reshape(batch_size, feature_map_size_H, feature_map_size_W, -1).permute(0, 3, 1, 2).contiguous()
                     agent_dict['pillar_features'] = self.mamba_layernorm2(new_x[:num_pillars] + pillar_features)
                     x_down = self.sub_dim(x_down)
                     # 更新x_down，但保持x不变（x是原始图像特征）
@@ -680,14 +750,13 @@ class LSSTransform_Lite(nn.Module):
             # Resize to target output shape (200, 704)
             return x
 
+        ##########################################################################################################
         # 如果指定了agent，只处理该agent
         if agent is not None:
+            self.agent = agent
             if agent in batch_dict and 'image_fpn' in batch_dict[agent]:
-                # 确保相机矩阵存在
-                ensure_cam_mats(batch_dict[agent])
                 # 处理单个agent
                 bev_feature = process_single_agent(batch_dict[agent], agent)
-                bev_feature = F.interpolate(bev_feature, size=(200, 704), mode='bilinear', align_corners=False)
                 batch_dict[agent]['spatial_features_img'] = bev_feature
                 return batch_dict
             else:
@@ -712,8 +781,6 @@ class LSSTransform_Lite(nn.Module):
                 if not has_valid_cam_data:
                     continue
                 
-                # 确保相机矩阵存在
-                ensure_cam_mats(agent_dict)
                 # 处理单个agent
                 bev_feature = process_single_agent(agent_dict, agent_name)
                 batch_dict[agent_name]['spatial_features_img'] = bev_feature.permute(0,1,3,2).contiguous()
@@ -721,7 +788,6 @@ class LSSTransform_Lite(nn.Module):
 
         # 单智能体fallback (原始行为)
         if 'image_fpn' in batch_dict:
-            ensure_cam_mats(batch_dict)
             bev_feature = process_single_agent(batch_dict, 'single')
             batch_dict['spatial_features_img'] = bev_feature.permute(0,1,3,2).contiguous()
             return batch_dict
@@ -817,10 +883,11 @@ class LSSTransform(nn.Module):
         self.nx = nn.Parameter(nx, requires_grad=False)
 
         self.C = out_channel
-        self.frustum = self.create_frustum()
-        self.D = self.frustum.shape[0]
+        self.frustum_list = self.create_frustum()
+        self.D = [frustum.shape[0] for frustum in self.frustum_list]
         self.fp16_enabled = False
         self.depthnet = nn.Conv2d(in_channel, self.D + self.C, 1)
+        self.depthnet_list = nn.ModuleList([nn.Conv2d(in_channel, D + self.C, 1) for D in self.D])
         if downsample > 1:
             assert downsample == 2, downsample
             self.downsample = nn.Sequential(
@@ -962,7 +1029,7 @@ class LSSTransform(nn.Module):
             ]
         )
         geom_feats = torch.cat((geom_feats, batch_ix), 1)
-
+        
         # filter out points that are outside box
         kept = (
             (geom_feats[:, 0] >= 0)
@@ -1001,6 +1068,9 @@ class LSSTransform(nn.Module):
         # collapse Z
         final = torch.cat(x.unbind(dim=2), 1)
 
+        # 修正空间维度顺序：bev_pool返回[B,C,nx,ny]，需要转换为[B,C,ny,nx]以匹配后续逻辑
+        # 最终输出需要是[B,C,H=200,W=704]格式
+        final = final.permute(0, 1, 3, 2).contiguous()
         
         return final
 

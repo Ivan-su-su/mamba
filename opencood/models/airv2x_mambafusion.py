@@ -1,46 +1,58 @@
 from opencood.models.mambafusion_modules.detector3d_template import Detector3DTemplate
-from opencood.models.mambafusion_modules import backbones_image, view_transforms, mm_backbone #get
-from opencood.models.mambafusion_modules.backbones_image import img_neck #get 
-from opencood.models.mambafusion_modules.backbones_2d import fuser #get
-from opencood.models.mambafusion_modules.spconv_utils import find_all_spconv_keys #get
-from opencood.models.mambafusion_modules.vmamba import build_vssm_model #ge
+from opencood.models.mambafusion_modules.backbones_3d import pfe, vfe
+from opencood.models.mambafusion_modules import backbones_3d, mm_backbone, view_transforms, backbones_2d
+from opencood.models.mambafusion_modules.backbones_image import img_neck
+from opencood.models.mambafusion_modules.backbones_2d import fuser, map_to_bev
+from opencood.models.mambafusion_modules.spconv_utils import find_all_spconv_keys
+from opencood.models.mambafusion_modules.vmamba import build_vssm_model
 import torch.profiler
 import torch.nn.functional as F
 from easydict import EasyDict
+
 class Airv2xMambafusion(Detector3DTemplate):
-    def __init__(self, model_cfg, dataset, num_class = 7):
-        super().__init__(model_cfg=model_cfg, num_class=num_class, dataset=dataset)
+    def __init__(self, model_cfg, dataset):
+        super().__init__(model_cfg=model_cfg, dataset=dataset)
         self.model_cfg = EasyDict(self.model_cfg)
+        self.dataset = dataset
         self.use_voxel_mamba = self.model_cfg.get('USE_VOXEL_MAMBA', False)
         self.new_order = self.model_cfg.VTRANSFORM.get('USE_MAMBA', False)
         self.agent = ['vehicle','drone','rsu']
+        
+        # 从配置读取BEV尺寸，用于后续的默认值设置
+        self.bev_size_H = self.model_cfg.get('BEV_SIZE_H', 200)
+        self.bev_size_W = self.model_cfg.get('BEV_SIZE_W', 704)
+
         if self.use_voxel_mamba:
-            self.module_topology = [
-                'vfe', 'backbone_3d', 'mm_backbone', 'map_to_bev_module', 
-                'neck','vtransform', 'fuser',
-                'backbone_2d','dense_head',
-            ]
             if self.new_order:
                 self.module_topology = [
                     'vfe', 'backbone_3d', 'mm_backbone', 
                     'neck','vtransform', 'map_to_bev_module', 'fuser',
                     'backbone_2d'
                 ]
+            else:
+                self.module_topology = [
+                    'vfe', 'backbone_3d', 'mm_backbone', 'map_to_bev_module', 
+                    'neck','vtransform', 'fuser',
+                    'backbone_2d','dense_head',
+                ]
+            
         else:
-            self.module_topology = [
-                'vfe','mm_backbone', 'map_to_bev_module', 
-                'neck','vtransform', 'fuser',
-                'backbone_2d','dense_head',
-            ]
             if self.new_order:
                 self.module_topology = [
                     'vfe','mm_backbone', 
                     'neck','vtransform', 'map_to_bev_module', 'fuser',
                     'backbone_2d','dense_head',
                 ]
-        num_anchors = 2  # 从配置文件 anchor_args.num = 2
-        num_classes = 7  # 从配置文件 num_class = 7（与Where2Comm一致）
-        C = 512
+            else:
+                self.module_topology = [
+                    'vfe','mm_backbone', 'map_to_bev_module', 
+                    'neck','vtransform', 'fuser',
+                    'backbone_2d','dense_head',
+                ]
+        
+        num_anchors = self.model_cfg.get('num_anchors', 2)
+        num_classes = self.model_cfg.get('num_classes', 7)
+        C = 512   # TODO: 从配置文件中读取
         self.cls_head = torch.nn.Conv2d(C, num_anchors * num_classes, kernel_size=1)
         self.reg_head = torch.nn.Conv2d(C, 7 * num_anchors, kernel_size=1)
         self.obj_head = torch.nn.Conv2d(C, num_anchors, kernel_size=1)
@@ -107,7 +119,72 @@ class Airv2xMambafusion(Detector3DTemplate):
         print(f"检测头总计: {head_total:10,} ({(head_total/total_params)*100:5.1f}%)")
         
         print("=" * 80)
-       
+    
+
+    def build_networks(self):
+        model_info_dict = {
+            'module_list': [],
+            # TODO: 这些不需要从数据集中读，可以从配置文件中读取
+            'num_rawpoint_features': self.dataset.point_feature_encoder.num_point_features,   #5
+            'num_point_features': self.dataset.point_feature_encoder.num_point_features,   #5
+            'grid_size': self.dataset.grid_size,
+            'point_cloud_range': self.dataset.point_cloud_range,
+            'voxel_size': self.dataset.voxel_size,
+            'depth_downsample_factor': self.dataset.depth_downsample_factor
+        }
+        for module_name in self.module_topology:
+            module, model_info_dict = getattr(self, 'build_%s' % module_name)(
+                model_info_dict=model_info_dict
+            )
+            self.add_module(module_name, module)
+        return model_info_dict['module_list']
+
+    def build_vfe(self, model_info_dict):
+        if self.model_cfg.get('VFE', None) is None:
+            return None, model_info_dict
+
+        vfe_module = vfe.__all__[self.model_cfg.VFE.NAME](
+            model_cfg=self.model_cfg.VFE,
+            num_point_features=model_info_dict['num_rawpoint_features'],
+            point_cloud_range=model_info_dict['point_cloud_range'],
+            voxel_size=model_info_dict['voxel_size'],
+            grid_size=model_info_dict['grid_size'],
+            depth_downsample_factor=model_info_dict['depth_downsample_factor']
+        )
+        model_info_dict['num_point_features'] = vfe_module.get_output_feature_dim()
+        model_info_dict['module_list'].append(vfe_module)
+        return vfe_module, model_info_dict
+
+
+    def build_backbone_3d(self, model_info_dict):
+        if self.model_cfg.get('BACKBONE_3D', None) is None:
+            return None, model_info_dict
+
+        backbone_3d_module = backbones_3d.__all__[self.model_cfg.BACKBONE_3D.NAME](
+            model_cfg=self.model_cfg.BACKBONE_3D,
+            input_channels=model_info_dict['num_point_features'],
+            grid_size=model_info_dict['grid_size'],
+            voxel_size=model_info_dict['voxel_size'],
+            point_cloud_range=model_info_dict['point_cloud_range']
+        )
+        model_info_dict['module_list'].append(backbone_3d_module)
+        model_info_dict['num_point_features'] = backbone_3d_module.num_point_features
+        model_info_dict['backbone_channels'] = backbone_3d_module.backbone_channels \
+            if hasattr(backbone_3d_module, 'backbone_channels') else None
+        return backbone_3d_module, model_info_dict
+
+    def build_mm_backbone(self, model_info_dict):
+        if self.model_cfg.get('MM_BACKBONE', None) is None:
+            return None, model_info_dict
+        mm_backbone_name = self.model_cfg.MM_BACKBONE.NAME
+        del self.model_cfg.MM_BACKBONE['NAME']
+        mm_backbone_module = mm_backbone.__all__[mm_backbone_name](
+            model_cfg=self.model_cfg.MM_BACKBONE
+            )
+        model_info_dict['module_list'].append(mm_backbone_module)
+
+        return mm_backbone_module, model_info_dict
+
     def build_neck(self,model_info_dict):
         if self.model_cfg.get('NECK', None) is None:
             return None, model_info_dict
@@ -127,6 +204,18 @@ class Airv2xMambafusion(Detector3DTemplate):
         model_info_dict['module_list'].append(vtransform_module)
 
         return vtransform_module, model_info_dict
+
+    def build_map_to_bev_module(self, model_info_dict):
+        if self.model_cfg.get('MAP_TO_BEV', None) is None:
+            return None, model_info_dict
+
+        map_to_bev_module = map_to_bev.__all__[self.model_cfg.MAP_TO_BEV.NAME](
+            model_cfg=self.model_cfg.MAP_TO_BEV,
+            grid_size=model_info_dict['grid_size']
+        )
+        model_info_dict['module_list'].append(map_to_bev_module)
+        model_info_dict['num_bev_features'] = map_to_bev_module.num_bev_features
+        return map_to_bev_module, model_info_dict
     
     def build_fuser(self, model_info_dict):
         if self.model_cfg.get('FUSER', None) is None:
@@ -139,17 +228,18 @@ class Airv2xMambafusion(Detector3DTemplate):
         model_info_dict['num_bev_features'] = self.model_cfg.FUSER.OUT_CHANNEL
         return fuser_module, model_info_dict
 
-    def build_mm_backbone(self, model_info_dict):
-        if self.model_cfg.get('MM_BACKBONE', None) is None:
+    def build_backbone_2d(self, model_info_dict):
+        if self.model_cfg.get('BACKBONE_2D', None) is None:
             return None, model_info_dict
-        mm_backbone_name = self.model_cfg.MM_BACKBONE.NAME
-        del self.model_cfg.MM_BACKBONE['NAME']
-        mm_backbone_module = mm_backbone.__all__[mm_backbone_name](
-            model_cfg=self.model_cfg.MM_BACKBONE
-            )
-        model_info_dict['module_list'].append(mm_backbone_module)
 
-        return mm_backbone_module, model_info_dict
+        backbone_2d_module = backbones_2d.__all__[self.model_cfg.BACKBONE_2D.NAME](
+            model_cfg=self.model_cfg.BACKBONE_2D,
+            input_channels=model_info_dict.get('num_bev_features', None)
+        )
+        model_info_dict['module_list'].append(backbone_2d_module)
+        model_info_dict['num_bev_features'] = backbone_2d_module.num_bev_features
+        return backbone_2d_module, model_info_dict
+
     
     def _load_state_dict(self, model_state_disk, *, strict=True):
         state_dict = self.state_dict()  # local cache of state_dict
@@ -189,9 +279,58 @@ class Airv2xMambafusion(Detector3DTemplate):
             state_dict.update(update_model_state)
             self.load_state_dict(state_dict)
         return state_dict, update_model_state
-
+    
+    def pre_process(self, agent_idx, available_agents, batch_dict):
+        for agent in available_agents:
+            camera_num = batch_dict[agent]['batch_merged_cam_inputs']['imgs'].shape[1]
+            agent_to_ego_transform = batch_dict['img_pairwise_t_matrix_collab'][0,agent_idx[agent]:agent_idx[agent]+batch_dict[agent]['record_len'],0,:,:]
+            agent_to_ego_transform = agent_to_ego_transform.unsqueeze(0)
+            agent_to_ego_transform = agent_to_ego_transform.repeat_interleave(camera_num, dim=1)
+            batch_dict[agent]['agent_to_ego_transform'] = agent_to_ego_transform
+        return batch_dict
+    
+    def _check_agent_shapes(self, agent_dict: dict, agent: str, module_name: str):
+        """检查agent数据的shape"""
+        issues = []
+        
+        # 检查voxel数据
+        if 'voxel_features' in agent_dict and 'voxel_coords' in agent_dict:
+            voxel_features = agent_dict['voxel_features']
+            voxel_coords = agent_dict['voxel_coords']
+            if isinstance(voxel_features, torch.Tensor) and isinstance(voxel_coords, torch.Tensor):
+                if voxel_features.shape[0] != voxel_coords.shape[0]:
+                    issues.append(f"[{module_name}] {agent}: voxel_features数量 {voxel_features.shape[0]} != voxel_coords数量 {voxel_coords.shape[0]}")
+                if len(voxel_coords.shape) != 2 or voxel_coords.shape[1] != 4:
+                    issues.append(f"[{module_name}] {agent}: voxel_coords shape应为[N, 4]，实际为{voxel_coords.shape}")
+        
+        # 检查BEV特征
+        if 'spatial_features' in agent_dict:
+            spatial_features = agent_dict['spatial_features']
+            if isinstance(spatial_features, torch.Tensor):
+                if len(spatial_features.shape) != 4:
+                    issues.append(f"[{module_name}] {agent}: spatial_features应为4D [B,C,H,W]，实际为{spatial_features.shape}")
+                else:
+                    # 检查BEV尺寸是否匹配配置
+                    H, W = spatial_features.shape[2:]
+                    expected_H = self.bev_size_H // 2  # 考虑stride=2
+                    expected_W = self.bev_size_W // 2
+                    if H != expected_H or W != expected_W:
+                        issues.append(f"[{module_name}] {agent}: spatial_features BEV尺寸 ({H}, {W}) 与预期 ({expected_H}, {expected_W}) 不匹配")
+        
+        if issues:
+            print(f"⚠️ Shape检查警告 [{module_name}] {agent}:")
+            for issue in issues:
+                print(f"    {issue}")
+    
+    def _check_output_shapes(self, agent_dict: dict, agent: str, module_name: str):
+        """检查模块输出shape"""
+        # 可以在这里添加输出shape检查
+        pass
+    
     def forward(self, batch_dict): 
         available_agents = []
+        count = 0
+        agent_idx = {}
         for agent in self.agent:
             if agent == 'vehicle' and 'origin_lidar' in batch_dict:
                 # 检查vehicle的origin_lidar是否有效
@@ -203,10 +342,15 @@ class Airv2xMambafusion(Detector3DTemplate):
                 origin_lidar = batch_dict[f'origin_lidar_{agent}']
                 if origin_lidar is not None and origin_lidar.numel() > 0 and torch.count_nonzero(origin_lidar).item() > 0:
                     available_agents.append(agent)
+            agent_idx[agent] = count
+            count += batch_dict[agent]['record_len'].item()
         
         # AirV2X需要agent循环处理，但要保持数据流一致
         print("available_agents:",available_agents)
+        batch_dict = self.pre_process(agent_idx, available_agents, batch_dict)
+        
         for cur_module, model_name in zip(self.module_list, self.module_topology):
+            print("model_name:",model_name)
             if model_name in ['vfe', 'backbone_3d', 'mm_backbone', 'map_to_bev_module','vtransform']:
                 # 这些模块需要agent参数，但只处理有效的agent
                 for agent in available_agents:
@@ -230,24 +374,19 @@ class Airv2xMambafusion(Detector3DTemplate):
         spatial_features = batch_dict.get('spatial_features_2d', None)  # [B, C, H, W]
         
         if spatial_features is not None:
-            B, C, H, W = spatial_features.shape
-            
             # 通过头部网络得到最终-output
-            psm = self.cls_head(spatial_features)  # [B, A*C, H, W] = [B, 2*7, 180, 180]
-            rm = self.reg_head(spatial_features)   # [B, A*7, H, W] = [B, 2*7, 180, 180]
-            obj = self.obj_head(spatial_features)  # [B, A, H, W] = [B, 2, 180, 180]
-            
-            # 输出尺寸已经匹配，不需要调整
-            print(f"[Airv2xMambafusion] 输出尺寸: psm={psm.shape}, rm={rm.shape}, obj={obj.shape}")
+            psm = self.cls_head(spatial_features)  # [B, A*C, H, W] = [B, 2*7, H, W]
+            rm = self.reg_head(spatial_features)   # [B, A*7, H, W] = [B, 2*7, H, W]
+            obj = self.obj_head(spatial_features)  # [B, A, H, W] = [B, 2, H, W]
             
         else:
             # 如果没有特征，创建空的特征
-            # 使用默认尺寸 H=100, W=352 (考虑feature_stride=2)
-            default_H, default_W = 100, 352
+            # 使用配置中的BEV尺寸（考虑feature_stride=2，所以实际是 H/2, W/2）
+            default_H, default_W = self.bev_size_H // 2, self.bev_size_W // 2
             psm = torch.zeros(1, 14, default_H, default_W, device=next(self.parameters()).device)  # 2*7=14
             rm = torch.zeros(1, 14, default_H, default_W, device=next(self.parameters()).device)   # 2*7=14
-            obj = torch.zeros(1, 2, default_H, default_W, device=next(self.parameters()).device)   # 2
-        
+            obj = torch.zeros(1, 2, default_H, default_W, device=next(self.parameters()).device)   # 
+
         # 创建AirV2X兼容的输出格式
         output_dict = {
             'psm': psm,                  # [1, A*C, H, W] - 分类特征
@@ -287,6 +426,10 @@ class Airv2xMambafusion(Detector3DTemplate):
         recall_dict = {}
         for index in range(batch_size):
             pred_boxes = final_pred_dict[index]['pred_boxes']
+
+            # 简单退化检查：打印每帧 3D 检测框数量
+            # 注意：如需关闭，只需注释或删除下一行
+            print(f"[Airv2xMambafusion] batch_index={index}, num_pred_boxes={pred_boxes.shape[0]}")
 
             recall_dict = self.generate_recall_record(
                 box_preds=pred_boxes,

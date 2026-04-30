@@ -1,6 +1,7 @@
 
 # from opencood.models.mambafusion_modules.spconv_utils import find_all_spconv_keys
 
+import os
 import torch
 import torch.nn as nn
 import torch.profiler
@@ -19,7 +20,7 @@ class Airv2xGaussian(Airv2xBase):
     def __init__(self, model_cfg):
         super().__init__(args=model_cfg)
         self.model_cfg = EasyDict(model_cfg)
-        
+        self.iter_num = self.model_cfg.get('ITER_NUM', 2)
         # Agent类型定义
         self.agent = ['vehicle', 'rsu', 'drone']
         
@@ -56,10 +57,15 @@ class Airv2xGaussian(Airv2xBase):
         self.reg_head = torch.nn.Conv2d(C, 7 * num_anchors, kernel_size=1)
         self.obj_head = torch.nn.Conv2d(C, num_anchors, kernel_size=1)
         
-        # 构建网络模块
-        self.module_list = self.build_networks()
+        # 构建网络模块，直接返回字典映射
+        self.module_dict = self.build_networks()
+        # 为了向后兼容，保留 module_list（从字典中提取，按 topology 顺序）
+        self.module_list = [self.module_dict.get(name) for name in self.module_topology]#可去
         self.time_list = []
-        
+
+        # 加载预训练 backbone 权重（如配置中指定）
+        self._load_pretrained_backbones(model_cfg)
+
         # 打印各模块参数量
         self.print_module_params()
 
@@ -123,16 +129,61 @@ class Airv2xGaussian(Airv2xBase):
         print("=" * 80)
 
 
+    def _load_pretrained_backbones(self, model_cfg):
+        """从配置的路径加载 backbone_3d 和 backbone_2d 的预训练权重。
+
+        在 config.yaml 的模型 args 中配置：
+            PRETRAINED_CKPTS:
+              BACKBONE_3D: <path_to_3d_ckpt>
+              BACKBONE_2D: <path_to_2d_ckpt>
+        路径可以是绝对路径，也可以是相对于项目根目录的相对路径。
+        """
+        ckpt_cfg = model_cfg.get('PRETRAINED_CKPTS', None)
+        if ckpt_cfg is None:
+            return
+
+        # 解析路径：相对路径以项目根目录（本文件上两级）为基准
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)
+        )))
+
+        ckpt_3d = ckpt_cfg.get('BACKBONE_3D', None)
+        ckpt_2d = ckpt_cfg.get('BACKBONE_2D', None)
+
+        if ckpt_3d and self.backbone_3d is not None:
+            if not os.path.isabs(ckpt_3d):
+                ckpt_3d = os.path.join(project_root, ckpt_3d)
+            if os.path.exists(ckpt_3d):
+                print(f"[Airv2xGaussian] 加载 backbone_3d 预训练权重: {ckpt_3d}")
+                self.backbone_3d.load_pretrained_weights(
+                    ckpt_3d, strict=False, freeze_pretrained=False
+                )
+            else:
+                print(f"[Airv2xGaussian] 警告: backbone_3d 预训练权重文件不存在: {ckpt_3d}")
+
+        if ckpt_2d and self.backbone_2d is not None:
+            if not os.path.isabs(ckpt_2d):
+                ckpt_2d = os.path.join(project_root, ckpt_2d)
+            if os.path.exists(ckpt_2d):
+                print(f"[Airv2xGaussian] 加载 backbone_2d 预训练权重: {ckpt_2d}")
+                self.backbone_2d.load_pretrained_weights(ckpt_2d, strict=False)
+            else:
+                print(f"[Airv2xGaussian] 警告: backbone_2d 预训练权重文件不存在: {ckpt_2d}")
+
     def build_networks(self):
         model_info_dict = {
-            'module_list': [],
+            'module_list': [],  # 保留用于向后兼容，但不再返回
+            'module_dict': {},  # 直接构建字典映射
         }
         for module_name in self.module_topology:
             module, model_info_dict = getattr(self, 'build_%s' % module_name)(
                 model_info_dict=model_info_dict
             )
             self.add_module(module_name, module)
-        return model_info_dict['module_list']
+            # 同时添加到字典中（如果模块不为None）
+            if module is not None:
+                model_info_dict['module_dict'][module_name] = module
+        return model_info_dict['module_dict']
     
 
     def build_backbone_3d(self, model_info_dict):
@@ -281,11 +332,27 @@ class Airv2xGaussian(Airv2xBase):
                     available_agents.append(agent)
         
         print("available_agents:", available_agents)
-        
+        import time
+        start_time = time.time()
         # 按照模块拓扑结构执行前向传播
-        for cur_module in self.module_list:
-            # import pdb; pdb.set_trace()
-            batch_dict = cur_module(batch_dict, available_agents)
+        for model_name,module in self.module_dict.items():
+            if model_name == 'gaussian_refiner':
+                for i in range(self.iter_num):
+                    batch_dict = module(batch_dict, available_agents)
+            elif model_name == 'gaussian2bev':
+                for i in range(self.iter_num):
+                    batch_dict = self.module_dict['gaussian_refiner'](batch_dict, available_agents,fused_iter=True)
+                batch_dict = module(batch_dict, available_agents)
+            else:
+                batch_dict = module(batch_dict,available_agents)
+        end_time = time.time()
+        print(f"forward Time taken: {end_time - start_time} seconds")
+        # for cur_module, model_name in zip(self.module_list, self.module_topology):
+        #     # import pdb; pdb.set_trace()
+        #     if model_name in ['gaussian_refiner','gaussian2bev']:
+        #         batch_dict = cur_module(batch_dict, available_agents)
+        #     else:
+        #         batch_dict = cur_module(batch_dict)
 
         # 输出BEV特征格式
         spatial_features = batch_dict['spatial_features_2d']  # [B, C, H, W]

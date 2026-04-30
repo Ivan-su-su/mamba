@@ -189,4 +189,12 @@ simple_multi_agent_bev/
 bev_visualizations/
 bev_statistics/
 AirV2X-Perception-Checkpoints/**/release/vis_bev/
+# 仅保留 Hilbert 模板目录下的权重，其余仍忽略
+!opencood/models/mambafusion_modules/ckpts/hilbert_template/
+!opencood/models/mambafusion_modules/ckpts/hilbert_template/**
+
+# 仅跟踪 cp38 的 .so（cp37/cp39 不上传；避免 selective_scan 等 >100MB 被拒）
+!opencood/**/*cpython-38-*.so
+opencood/**/build/**/*.so
+*copy.so
 

@@ -95,10 +95,17 @@ def inference_early_fusion(batch_data, model, dataset):
     gt_box_tensor : torch.Tensor
         The tensor of gt bounding box.
     """
+    import time
     output_dict = OrderedDict()
     cav_content = batch_data["ego"]
     # print('type(cav_content) is ',type(cav_content))
+    
+    # 测量模型前向传播时间
+    model_start = time.time()
     model_output = model(cav_content)
+    model_end = time.time()
+    print(f"[inference_early_fusion] 模型前向传播时间: {model_end - model_start:.4f} 秒")
+    
     output_dict["ego"] = model_output
 
     # 检查模型是否直接返回了预测结果（Airv2xMambafusion的情况）
@@ -109,18 +116,39 @@ def inference_early_fusion(batch_data, model, dataset):
         pred_boxes3d = model_output['pred_boxes3d']
         
         # 生成gt_box_tensor
+        post_start = time.time()
         gt_box_tensor = dataset.post_processor.generate_gt_bbx(batch_data["ego"][0])
+        post_end = time.time()
+        print(f"[inference_early_fusion] GT生成时间: {post_end - post_start:.4f} 秒")
         
         return pred_box_tensor, pred_score, gt_box_tensor, pred_boxes3d
 
-    try:
-        pred_box_tensor, pred_score, gt_box_tensor = dataset.post_process(
-            batch_data, output_dict
-        )
-    except:
+    # 测量后处理时间
+    post_start = time.time()
+    # 修复：根据dataset类型判断返回值数量，避免重复调用
+    dataset_type = type(dataset).__name__
+    if 'Airv2x' in dataset_type or 'airv2x' in dataset_type.lower():
+        # airv2x数据集返回7个值
         pred_box_tensor, pred_score, pred_labels, pred_boxes3d, gt_box_tensor, gt_class_label_list, gt_track_list = dataset.post_process(
             batch_data, output_dict
         )
+    else:
+        # 其他数据集返回3个值
+        try:
+            pred_box_tensor, pred_score, gt_box_tensor = dataset.post_process(
+                batch_data, output_dict
+            )
+            pred_boxes3d = None
+        except ValueError:
+            # 如果返回更多值，尝试解包
+            result = dataset.post_process(batch_data, output_dict)
+            if len(result) == 7:
+                pred_box_tensor, pred_score, pred_labels, pred_boxes3d, gt_box_tensor, gt_class_label_list, gt_track_list = result
+            else:
+                pred_box_tensor, pred_score, gt_box_tensor = result[:3]
+                pred_boxes3d = None
+    post_end = time.time()
+    print(f"[inference_early_fusion] 后处理(post_process)时间: {post_end - post_start:.4f} 秒")
         
     return pred_box_tensor, pred_score, gt_box_tensor, pred_boxes3d
 

@@ -32,9 +32,9 @@ train: &train True
 # Dataset #
 ###########
 
-root_dir: '/home/chubin/suyi/dataset/AirV2X-Perception/train/train'
-validate_dir: '/home/chubin/suyi/dataset/AirV2X-Perception/val/val'
-test_dir: '/home/chubin/suyi/dataset/AirV2X-Perception/test/test'
+root_dir: '/home/suyi/AirV2X-Perception/train/train'
+validate_dir: '/home/suyi/AirV2X-Perception/val/val'
+test_dir: '/home/suyi/AirV2X-Perception/test/test'
 num_class: &num_class 7
 num_anchor: &num_anchor 2
 

@@ -104,7 +104,16 @@ class ConvFuserTPV1(nn.Module):
         self.use_vmamba = model_cfg.get('USE_VMAMBA', True)   #True
         self.use_checkpoint = model_cfg.get('USE_CHECKPOINT', True)   #True
         self.use_merge_after = model_cfg.get('USE_MERGE_AFTER', False)
-
+        self.downsample = model_cfg.get('DOWNSAMPLE', 2)
+        self.use_shrink = self.downsample is not None and self.downsample > 1
+        if self.use_shrink:
+            self.shrink_xy = self._build_shrink_block(out_channel)
+            self.shrink_xz = self._build_shrink_block(out_channel)
+            self.shrink_yz = self._build_shrink_block(out_channel)
+        else:
+            self.shrink_xy = nn.Identity()
+            self.shrink_xz = nn.Identity()
+            self.shrink_yz = nn.Identity()
         if self.use_merge_after:
             depths = self.model_cfg.get('DEPTHS', [1])
             if isinstance(depths, list) and len(depths) > 0:
@@ -466,6 +475,23 @@ class ConvFuserTPV1(nn.Module):
                 blocks2=nn.Sequential(*blocks2),
             ))
 
+    def _build_shrink_block(self, channels: int) -> nn.Module:
+        """构建用于TPV平面压缩的卷积块"""
+        if not self.use_shrink:
+            return nn.Identity()
+        return nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                stride=self.downsample,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+
 
     def forward(self, batch_dict, available_agents):
         """
@@ -478,7 +504,7 @@ class ConvFuserTPV1(nn.Module):
             batch_dict: Updated with fused TPV features
         """
         #TODO: not robust, 如果TPV形状非偶数会出问题
-                
+        import pdb; pdb.set_trace()
         # Get image TPV features
         for agent_type in available_agents:
             img_xy = batch_dict[agent_type]['image_tpv_xy']   #[B, 128, 200, 704]
@@ -514,9 +540,20 @@ class ConvFuserTPV1(nn.Module):
             final_xz = self.conv(cat_xz)
             final_yz = self.conv(cat_yz)
 
+            final_xy = self.shrink_xy(final_xy)
+            final_xz = self.shrink_xz(final_xz)
+            final_yz = self.shrink_yz(final_yz)
+
             batch_dict[agent_type]['fused_tpv_xy'] = final_xy
             batch_dict[agent_type]['fused_tpv_xz'] = final_xz
             batch_dict[agent_type]['fused_tpv_yz'] = final_yz
+            # Pop原始TPV特征，保留融合后的fused_tpv_xy/xz/yz
+            batch_dict[agent_type].pop('image_tpv_xy', None)
+            batch_dict[agent_type].pop('image_tpv_xz', None)
+            batch_dict[agent_type].pop('image_tpv_yz', None)
+            batch_dict[agent_type].pop('tpv_xy', None)
+            batch_dict[agent_type].pop('tpv_xz', None)
+            batch_dict[agent_type].pop('tpv_yz', None)
             print("TPV Fusion Done for ", agent_type)
             # 此时batch_dict的结构是：
             # {
@@ -555,6 +592,16 @@ class ConvFuserTPV1(nn.Module):
     
 
     def mamba_forward(self, img_tpv, lidar_tpv):
+        # make sure triton kernels see GPU tensors
+        target_device = next(self.parameters()).device
+        if img_tpv.device != target_device:
+            img_tpv = img_tpv.to(target_device, non_blocking=True)
+        if lidar_tpv.device != target_device:
+            lidar_tpv = lidar_tpv.to(target_device, non_blocking=True)
+        # Triton kernels rely on current CUDA device; align it with tensors.
+        if target_device.type == 'cuda':
+            torch.cuda.set_device(target_device.index if target_device.index is not None else 0)
+
         ups_img = []
         ups_img.append(img_tpv)
         ups_lidar = []

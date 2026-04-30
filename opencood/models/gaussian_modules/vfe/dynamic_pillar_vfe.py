@@ -37,7 +37,44 @@ class PFNLayerV2(nn.Module):
         x = self.linear(inputs) # [num_points, 11] -> [num_points, 64]
         x = self.norm(x) if self.use_norm else x
         x = self.relu(x)
-        x_max = torch_scatter.scatter_max(x, unq_inv, dim=0)[0] # 对于每个unique值，获取其对应的最大值 [num_voxel, 64] 
+        # x_max = torch_scatter.scatter_max(x, unq_inv, dim=0)[0]
+        assert unq_inv.dtype in (torch.int32, torch.int64)
+        assert unq_inv.min() >= 0
+        assert unq_inv.device == x.device
+        # 确保长度对齐
+        assert x.shape[0] == unq_inv.shape[0], \
+            f"x len {x.shape[0]} != unq_inv len {unq_inv.shape[0]}"
+
+        # 统一 dtype / device
+        unq_inv = unq_inv.to(device=x.device, dtype=torch.long)
+
+        if unq_inv.numel() == 0:
+            # 没有点，返回空 voxel 特征
+            x_max = x.new_zeros((0, x.shape[1]))
+        else:
+            min_idx = int(unq_inv.min().item())
+            max_idx = int(unq_inv.max().item())
+
+            if min_idx < 0:
+                raise RuntimeError(f"unq_inv has negative index: min={min_idx}")
+
+            num_voxels = max_idx + 1  # voxel 数 = 最大 index + 1
+            N, C = x.shape
+
+            # 构造一个 [N, C] 的索引矩阵：每一行都是对应点所属的 voxel id
+            index_2d = unq_inv.view(-1, 1).expand(-1, C)  # [N, C]
+
+            # 初始化输出为很小的值
+            x_max = x.new_full((num_voxels, C), -1e9)
+
+            # 使用原生 scatter_reduce 做逐 voxel 最大值
+            x_max = x_max.scatter_reduce(
+                dim=0,
+                index=index_2d,
+                src=x,
+                reduce="amax",      # 最大值
+                include_self=True   # 和自身一起比较
+            ) # 对于每个unique值，获取其对应的最大值 [num_voxel, 64] 
 
         if self.last_vfe:
             return x_max

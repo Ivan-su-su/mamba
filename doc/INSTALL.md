@@ -47,6 +47,9 @@ python opencood/utils/setup.py build_ext --inplace
 
 # FPVRCNN's iou_loss dependency
 python opencood/pcdet_utils/setup.py build_ext --inplace
+
+# MambaFusion win_coors dependency
+python opencood/models/mambafusion_modules/ops/win_coors/setup.py build_ext --inplace
 ```
 
 ### if there is a problem about cv2:

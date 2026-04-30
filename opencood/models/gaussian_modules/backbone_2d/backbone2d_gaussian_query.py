@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict
-from efficientnet_pytorch import EfficientNet
+# from efficientnet_pytorch import EfficientNet
 import torchvision.models as models
 import numpy as np
 import cv2

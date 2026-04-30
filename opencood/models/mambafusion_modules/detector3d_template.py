@@ -12,10 +12,11 @@ from opencood.models.mambafusion_modules.model_utils import model_nms_utils
 
 
 class Detector3DTemplate(nn.Module):
-    def __init__(self, model_cfg, num_class, dataset):
+    # TODO： Airv2xMambafusion中num_class参数被删除，为不破坏原有代码，保留num_class参数，默认值为7
+    def __init__(self, model_cfg, dataset, num_class=7):
         super().__init__()
         self.model_cfg = model_cfg
-        self.num_class = num_class
+        self.num_class = model_cfg.get('num_classes', 7)
         self.dataset = dataset
         self.class_names = dataset.class_names
         self.register_buffer('global_step', torch.LongTensor(1).zero_())
@@ -49,62 +50,6 @@ class Detector3DTemplate(nn.Module):
             self.add_module(module_name, module)
         return model_info_dict['module_list']
 
-    def build_vfe(self, model_info_dict):
-        if self.model_cfg.get('VFE', None) is None:
-            return None, model_info_dict
-
-        vfe_module = vfe.__all__[self.model_cfg.VFE.NAME](
-            model_cfg=self.model_cfg.VFE,
-            num_point_features=model_info_dict['num_rawpoint_features'],
-            point_cloud_range=model_info_dict['point_cloud_range'],
-            voxel_size=model_info_dict['voxel_size'],
-            grid_size=model_info_dict['grid_size'],
-            depth_downsample_factor=model_info_dict['depth_downsample_factor']
-        )
-        model_info_dict['num_point_features'] = vfe_module.get_output_feature_dim()
-        model_info_dict['module_list'].append(vfe_module)
-        return vfe_module, model_info_dict
-
-    def build_backbone_3d(self, model_info_dict):
-        if self.model_cfg.get('BACKBONE_3D', None) is None:
-            return None, model_info_dict
-
-        backbone_3d_module = backbones_3d.__all__[self.model_cfg.BACKBONE_3D.NAME](
-            model_cfg=self.model_cfg.BACKBONE_3D,
-            input_channels=model_info_dict['num_point_features'],
-            grid_size=model_info_dict['grid_size'],
-            voxel_size=model_info_dict['voxel_size'],
-            point_cloud_range=model_info_dict['point_cloud_range']
-        )
-        model_info_dict['module_list'].append(backbone_3d_module)
-        model_info_dict['num_point_features'] = backbone_3d_module.num_point_features
-        model_info_dict['backbone_channels'] = backbone_3d_module.backbone_channels \
-            if hasattr(backbone_3d_module, 'backbone_channels') else None
-        return backbone_3d_module, model_info_dict
-
-    def build_map_to_bev_module(self, model_info_dict):
-        if self.model_cfg.get('MAP_TO_BEV', None) is None:
-            return None, model_info_dict
-
-        map_to_bev_module = map_to_bev.__all__[self.model_cfg.MAP_TO_BEV.NAME](
-            model_cfg=self.model_cfg.MAP_TO_BEV,
-            grid_size=model_info_dict['grid_size']
-        )
-        model_info_dict['module_list'].append(map_to_bev_module)
-        model_info_dict['num_bev_features'] = map_to_bev_module.num_bev_features
-        return map_to_bev_module, model_info_dict
-
-    def build_backbone_2d(self, model_info_dict):
-        if self.model_cfg.get('BACKBONE_2D', None) is None:
-            return None, model_info_dict
-
-        backbone_2d_module = backbones_2d.__all__[self.model_cfg.BACKBONE_2D.NAME](
-            model_cfg=self.model_cfg.BACKBONE_2D,
-            input_channels=model_info_dict.get('num_bev_features', None)
-        )
-        model_info_dict['module_list'].append(backbone_2d_module)
-        model_info_dict['num_bev_features'] = backbone_2d_module.num_bev_features
-        return backbone_2d_module, model_info_dict
 
     def build_pfe(self, model_info_dict):
         if self.model_cfg.get('PFE', None) is None:

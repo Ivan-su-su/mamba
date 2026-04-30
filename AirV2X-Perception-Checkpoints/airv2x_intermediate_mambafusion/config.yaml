@@ -4,12 +4,14 @@ POINT_FEATURE_ENCODING: {
     src_feature_list: ['x', 'y', 'z', 'intensity', 'timestamp'],
 }
 CLASS_NAMES: ['car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
-POINT_CLOUD_RANGE: [-140.8, -40.0, -3.0, 140.8, 40.0, 1.0]
-VOXEL_SIZE: [0.4,0.4,0.125]
+POINT_CLOUD_RANGE: &point_cloud_range [-140.8, -40.0, -3.0, 140.8, 40.0, 1.0]
+GRID_SIZE: [704, 200, 32]
+VOXEL_SIZE: &voxel_size [0.4,0.4,0.125]
 return_abs_coords: &return_abs_coords True
 use_test_interval: &use_test_interval 1
-active_sensors: &id001
+active_sensors: &id001   #TODO: 这个暂时没有实际用处
 - lidar
+- cam
 bevcam_fov: 110
 collaborators: &id002
 - vehicle
@@ -40,6 +42,7 @@ optimizer:
     weight_decay: 0.0001
   core_method: Adam
   lr: 0.0015
+
 fusion:
   args:
     drone_data_aug_conf: &id003
@@ -59,8 +62,8 @@ fusion:
       - 0.38
       - 0.55
       resize_lim_mamba:
-      - 0.48
-      - 0.48
+      - 0.55
+      - 0.55
       rot_lim:
       - -3.6
       - 3.6
@@ -100,8 +103,8 @@ fusion:
       - 0.38
       - 0.55
       resize_lim_mamba:
-      - 0.48
-      - 0.48
+      - 0.55
+      - 0.55
       rot_lim:
       - 0
       - 0
@@ -140,8 +143,8 @@ fusion:
       - 0.38
       - 0.55
       resize_lim_mamba:
-      - 0.48
-      - 0.48
+      - 0.55
+      - 0.55
       rot_lim:
       - 0
       - 0
@@ -164,12 +167,16 @@ fusion:
       - 10
       - 20.0
   core_method: IntermediateFusionDatasetAirv2x
+
 loss:
   det:
     args:
-      cls_weight: 1.0
+      cls_weight: 1.5
       num_class: 7
       reg: 2.0
+      obj_weight: 5.0
+      iou_weight: 0.5 #TODO
+      # recall_weight: 0.1 #TODO
     core_method: point_pillar_loss_multiclass
   seg:
     args:
@@ -186,16 +193,21 @@ loss:
       s_weights: 50.0
       seg_branch: both
     core_method: vanilla_seg_loss
+
 lr_scheduler:
   core_method: multistep
   gamma: 0.1
   step_size:
   - 10
-  - 25
-  - 40
+  - 15
+
 model:
     core_method: airv2x_mambafusion
     args:
+      bev_size_H: &id011 200
+      bev_size_W: &id012 704
+      num_anchors: 2
+      num_classes: 7
       active_sensors: *id001
       anchor_number: 2
       backbone_fix: false
@@ -215,7 +227,6 @@ model:
         drone: 5
         rsu: 5
         vehicle: 5
-      num_class: 7
       obj_head: true
       outC: 256
       proj_first: true
@@ -234,58 +245,54 @@ model:
           WITH_DISTANCE: False
           USE_ABSLOTE_XYZ: True
           USE_NORM: True
-          NUM_FILTERS: [ 64, 64 ]
+          NUM_FILTERS: [128, 128]
+          
       BACKBONE_3D:
           NAME: LION3DBackboneOneStride
           USE_DOW5: True
-          # DOW5_DIFF: False
+          DOW5_DIFF: True
           RETURN_ABS_COORDS: *return_abs_coords
-          FEATURE_DIM: 64
-          LAYER_DIM: [128, 128, 128, 128]
-          LAYER_DIM: [64,64,64,64]
-          NUM_LAYERS: 4
+          FEATURE_DIM: 128
           DEPTHS: [2, 2, 2, 2]
           LAYER_DOWN_SCALES: [[[2, 2, 2], [2, 2, 2]], [[2, 2, 2], [2, 2, 2]], [[2, 2, 2], [2, 2, 2]], [[2, 2, 2], [2, 2, 2]]]
-          WINDOW_SHAPE: [[16, 25, 32], [16, 25, 16], [16, 25, 8], [16, 25, 4]]
+          LAYER_DIM: [128, 128, 128, 128]
+          WINDOW_SHAPE: [[16, 10, 32], [16, 10, 16], [16, 10, 8], [16, 10, 4]]
           GROUP_SIZE: [4096, 2048, 1024, 512]
           DIRECTION: ['x', 'y']
           DIFF_SCALE: 0.2
-          DIFFUSION:  True #False #True
+          DIFFUSION:  True
           SHIFT: True
           OPERATOR:
             NAME: 'Mamba'
             CFG:
-              d_state: 8  # 减少状态维度，降低参数量
-              d_conv: 2   # 减少卷积核大小
-              expand: 1   # 减少扩展因子
-              drop_path: 0.1  # 减少dropout
+              d_state: 16  # 减少状态维度，降低参数量
+              d_conv: 4   # 减少卷积核大小
+              expand: 2   # 减少扩展因子
+              drop_path: 0.2  # 减少dropout
 
-      
       MM_BACKBONE:
-        NAME: MambaFusion
-        VIS_TAG: False
-        use_test_interval: *use_test_interval
+        NAME: MambaFusion_new
         RETURN_ABS_COORDS: *return_abs_coords
         USE_WINMAMBA: True
+        USE_VMAMBA_PRETRAIN: True
+        USE_MAMBA_INTER2: True
         USE_ALL_MAMBA: True
         AGENTS_AS_VIEWS: True
-        USE_MAMBA_INTER2: True
-        EXTRINSICS_IS_LIDAR_TO_CAM: True
-        USE_VMAMBA_PRETRAIN: True
-        AGENT_INTERACT: True
-        EMBED_TYPE: 'fixed'
+        USE_LIDAR2IMAGE_RELATION: True
+        MIXED_VERSION: 0
+        IMAGE_SHAPE: &img_shape [256, 704]
 
         PATCH_EMBED:
           in_channels: 3
-          image_size: [256, 704]
-          embed_dims: 64
+          image_size: *img_shape
+          embed_dims: 128
           patch_size: 8 
           patch_norm: True 
           norm_cfg: {'type': 'LN'}
 
         IMAGE_INPUT_LAYER:
           sparse_shape: [32, 88, 1]
-          d_model: [64]
+          d_model: [128]
           # set_info: [[90, 3]]
           set_info: [[90, 2]]
           window_shape: [[30, 30, 1]]
@@ -294,21 +301,21 @@ model:
           input_image: True
         
         LIDAR_INPUT_LAYER:
-          sparse_shape: [704, 200, 1]  # 减少LiDAR特征图尺寸
-          d_model: [64]
+          sparse_shape: [*id012, *id011, 1]  # 减少LiDAR特征图尺寸
+          d_model: [128]
           set_info: [[90, 2]]
           window_shape: [[32, 25, 1]]
           hybrid_factor: [1, 1, 1] # x, y, z
           shifts_list: [[[0, 0, 0], [15, 15, 0]]]
         
         set_info: [[90, 2]]
-        d_model: [64]
+        d_model: [128]
         nhead: [8]
         dim_feedforward: [256]
         dropout: 0.0
         activation: gelu
         # checkpoint_blocks: [0,1,2] # here can save 50% CUDA memory with marginal speed drop
-        checkpoint_blocks: [0, 1] # here can save 50% CUDA memory with marginal speed drop
+        checkpoint_blocks: [0,1,2] # here can save 50% CUDA memory with marginal speed drop
         layer_cfg: {'use_bn': False, 'split_ffn': True, 'split_residual': True}
 
         # fuse backbone config
@@ -317,8 +324,8 @@ model:
           LIDAR2IMAGE:
             block_start: 1
             block_end: 2
-            point_cloud_range: [-140.8, -40.0, -3.0, 140.8, 40.0, 1.0]
-            voxel_size: [0.4, 0.4, 0.125]
+            point_cloud_range: *point_cloud_range
+            voxel_size: *voxel_size
             sample_num: 1
             lidar2image_layer:
               sparse_shape: [96, 264, 6]
@@ -334,7 +341,7 @@ model:
       NECK:
         NAME: GeneralizedLSSFPN
         # IN_CHANNELS: [128, 128, 128]
-        IN_CHANNELS: [64, 64]
+        IN_CHANNELS: [128, 128]
         OUT_CHANNELS: 256
         START_LEVEL: 0
         END_LEVEL: -1
@@ -349,29 +356,74 @@ model:
         # USE_MULTI_BLOCK: True
         IMAGE_SIZE: [256,704]
         IN_CHANNEL: 256
-        OUT_CHANNEL: 80
+        OUT_CHANNEL: 128
         FEATURE_SIZE: [32,88]
         # XBOUND: [-140.8, 140.8, 0.782]  # 原始配置，输出 (360, 360)
         # YBOUND: [-40.0, 40.0, 0.222]   # 原始配置，输出 (360, 360)
-        XBOUND: [-140.8, 140.8, 0.4]   # 281.6 / 704
-        YBOUND: [-40.0, 40.0, 0.4]     # 80 / 200
-        TARGET_BEV_SIZE: [200, 704]  # 目标BEV输出尺寸，代码会自动计算步长
-        ZBOUND: [-4.0, 4.0, 8.0]
-        DBOUND: [1.0, 60.0, 0.5]
+        XBOUND: [[-140.8, 140.8, 0.4], [-140.8, 140.8, 0.4], [-140.8, 140.8, 0.4]]   # 281.6 / 704
+        YBOUND: [[-40.0, 40.0, 0.4], [-40.0, 40.0, 0.4], [-40.0, 40.0, 0.4]]     # 80 / 200
+        ZBOUND: [[-10.0,10.0, 20.0], [-30.0,30.0, 60.0], [-150.0,-6.0, 144.0]]
+        ZBOUND: [[-3.0,3.0, 6.0], [-3.0,3.0, 6.0], [-3.0,-3.0, 6.0]]
+        #DBOUND: [1.0, 60.0, 0.5]
+        DBOUND: [[2.0, 50.0, 1.0], [2.0, 50.0, 0.5], [6.0, 150.0, 0.5]]
         DOWNSAMPLE: 1
+        BEV_SIZE_H: *id011
+        BEV_SIZE_W: *id012
 
       FUSER:
         NAME: ConvFuser
         # USE_MERGE_AFTER: True
         # USE_VMAMBA: True
-        IN_CHANNEL: 144
+        IN_CHANNEL: 256
         OUT_CHANNEL: 128
+        IMAGE_CHANNEL: 128
+        LIDAR_CHANNEL: 128
         LIDAR_ONLY: False
+        USE_OFFSET_GUIDED_HIERARCHICAL_FUSION: True
+        OFFSET_GUIDED_HIERARCHICAL_FUSION:
+          NUM_POINTS: 4
+          OFFSET_RANGE: 2
+          TRANSMISSION_ALPHA: 0.75
+          WINDOW_SIZE: [10, 11]
+          ALIGN_CORNERS: False
+          PADDING_MODE: zeros
+          LOCAL_MAMBA_DEPTH: 1
+          GLOBAL_FUSION_TYPE: mamba_hilbert
+          GLOBAL_MAMBA_DEPTH: 2
+          GLOBAL_CONV_DEPTH: 2
+          SSM_D_STATE: 16
+          SSM_RATIO: 2.0
+          SSM_DT_RANK: auto
+          SSM_CONV: 3
+          SSM_CONV_BIAS: False
+          MLP_RATIO: 4.0
+          MLP_DROP_RATE: 0.0
+          FORWARD_TYPE: v05_noz
+          SAMPLE_DA_FFN_RATIO: 2.0
+          SAMPLE_DA_DROP_RATE: 0.1
+          SAMPLE_DA_LAYER_SCALE_INIT: 1e-2
+          FINAL_GATE_HIDDEN_DIM: 32
+        SPARSE_TEMPORAL:
+          ENABLE: True
+          CUE_DISTANCE_CHANNELS: 3
+          POINT_CLOUD_RANGE: [-140.8, -40.0, -3.0, 140.8, 40.0, 1.0]
+          ROUTE_WINDOW: [10, 11]
+          K_SAMPLES: 4
+          TOPK: 500
+          NEED_THRESHOLD: 0.5
+          SMOOTHING_KERNEL_SIZE: 3
+          RESIDUAL_OFFSET_RANGE: 2.0
+          BASE_SCALE_MULTIPLIER: 1.0
+          BASE_SCALE_MIN: 1.0
+          BASE_SCALE_MAX: 8.0
+          BASE_MOTION_EPSILON: 0.5
+          BASE_FIXED_EXPANSION_NO_MOTION: 0.5
+          INCLUDE_DIAGONAL_BASE_OFFSETS: False
 
       MAP_TO_BEV:
         NAME: PointPillarScatter3d
         INPUT_SHAPE: [704, 200, 1]
-        NUM_BEV_FEATURES: 64
+        NUM_BEV_FEATURES: 128
 
       BACKBONE_2D:
         NAME: BaseBEVResBackbone
@@ -568,6 +620,7 @@ model:
           - 144
         modalities:
         - lidar
+
 train_params:
   batch_size: 1
   epoches: 50
@@ -582,6 +635,10 @@ train_params:
   gradient_accumulation_steps: 4  # 增加梯度累积步数，减少内存峰值
   empty_cache_freq: 10  # 每10步安全清理GPU缓存
   max_grad_norm: 1.0  # 梯度裁剪
+temporal_training:
+  enable: true
+  load_from: "/mnt/home/suyi/AirV2X-Perception_copy/opencood/logs/airv2x_intermediate_mambafusion/default_2026_03_03_07_51_28"
+  mode: queue
 postprocess:
   anchor_args:
     D: 1
@@ -637,7 +694,8 @@ preprocess:
     - 1
   core_method: SpVoxelPreprocessor
   ego_type: vehicle
-root_dir: /home/chubin/suyi/dataset/AirV2X-Perception/train/train
-validate_dir: /home/chubin/suyi/dataset/AirV2X-Perception/val/val
-test_dir: /home/chubin/suyi/dataset/AirV2X-Perception/test/test
-    
+
+root_dir: /mnt/home/suyi/mini/train
+validate_dir: /mnt/home/suyi/mini/val
+test_dir: /mnt/home/suyi/mini/test
+visualize: True
