@@ -96,13 +96,13 @@ class PointPillarLossMultiClass(nn.Module):
         if self.gate_aux_enabled:
             self.gate_loss_weight = float(gate_fg_cfg.get("LOSS_WEIGHT", 1.0))
             self.gate_warmup_epochs = int(gate_fg_cfg.get("WARMUP_EPOCHS", 3))
-            self.dilation_kernel_size = int(gate_fg_cfg.get("DILATION_KERNEL_SIZE", 3))
-            self.use_soft_target = bool(gate_fg_cfg.get("USE_SOFT_TARGET", True))
-            self.soft_kernel_size = int(gate_fg_cfg.get("SOFT_TARGET_KERNEL_SIZE", 5))
-            self.soft_sigma = float(gate_fg_cfg.get("SOFT_TARGET_SIGMA", 1.0))
-            self.loss_type = str(gate_fg_cfg.get("LOSS_TYPE", "focal_bce")).lower()
+            self.gate_dilation_kernel_size = int(gate_fg_cfg.get("DILATION_KERNEL_SIZE", 3))
+            self.gate_use_soft_target = bool(gate_fg_cfg.get("USE_SOFT_TARGET", True))
+            self.gate_soft_kernel_size = int(gate_fg_cfg.get("SOFT_TARGET_KERNEL_SIZE", 5))
+            self.gate_soft_sigma = float(gate_fg_cfg.get("SOFT_TARGET_SIGMA", 1.0))
+            self.gate_loss_type = str(gate_fg_cfg.get("LOSS_TYPE", "focal_bce")).lower()
             # self.gate_foreground_alpha = float(gate_fg_cfg.get("ALPHA", 0.25))
-            self.aux_gamma = float(gate_fg_cfg.get("GAMMA", 2.0))
+            self.gate_aux_gamma = float(gate_fg_cfg.get("GAMMA", 2.0))
             self.gate_pos_weight = float(gate_fg_cfg.get("POS_WEIGHT", 2.0))
             self.gate_neg_visible_weight = float(gate_fg_cfg.get("NEG_VISIBLE_WEIGHT", 0.02))
             self.gate_neg_invisible_weight = float(gate_fg_cfg.get("NEG_INVISIBLE_WEIGHT", 0.05))
@@ -116,15 +116,22 @@ class PointPillarLossMultiClass(nn.Module):
         if self.need_aux_enabled:
             self.need_loss_weight = float(need_aux_cfg.get("LOSS_WEIGHT", 0.5))
             self.need_aux_warmup_epochs = int(need_aux_cfg.get("WARMUP_EPOCHS", 3))
-            self.dilation_kernel_size = int(need_aux_cfg.get("DILATION_KERNEL_SIZE", 3))
-            self.use_soft_target = bool(need_aux_cfg.get("USE_SOFT_TARGET", True))
-            self.soft_kernel_size = int(need_aux_cfg.get("SOFT_TARGET_KERNEL_SIZE", 5))
-            self.soft_sigma = float(need_aux_cfg.get("SOFT_TARGET_SIGMA", 1.0))
-            self.loss_type = str(need_aux_cfg.get("LOSS_TYPE", "focal_bce")).lower()
-            self.aux_gamma = float(need_aux_cfg.get("GAMMA", 2.0))
+            self.need_dilation_kernel_size = int(need_aux_cfg.get("DILATION_KERNEL_SIZE", 3))
+            self.need_use_soft_target = bool(need_aux_cfg.get("USE_SOFT_TARGET", True))
+            self.need_soft_kernel_size = int(need_aux_cfg.get("SOFT_TARGET_KERNEL_SIZE", 5))
+            self.need_soft_sigma = float(need_aux_cfg.get("SOFT_TARGET_SIGMA", 1.0))
+            self.need_loss_type = str(need_aux_cfg.get("LOSS_TYPE", "focal_bce")).lower()
+            self.need_aux_gamma = float(need_aux_cfg.get("GAMMA", 2.0))
             self.need_foreground_pos_weight = float(need_aux_cfg.get("POS_WEIGHT", 2.0))
-            self.need_foreground_neg_rsu_invisible_weight = float(need_aux_cfg.get("NEG_RSU_INVISIBLE_WEIGHT", 0.02))
-            self.need_foreground_neg_drone_invisible_weight = float(need_aux_cfg.get("NEG_DRONE_INVISIBLE_WEIGHT", 0.02))
+            self.need_foreground_neg_weight = float(need_aux_cfg.get("NEG_WEIGHT", 0.05))
+            self.need_target_type = str(need_aux_cfg.get("TARGET_TYPE", "window")).lower()
+            self.need_window_size = need_aux_cfg.get("WINDOW_SIZE", [10, 11])
+            self.need_bridge_one_window_gap = bool(need_aux_cfg.get("BRIDGE_ONE_WINDOW_GAP", True))
+            self.need_bridge_directions = need_aux_cfg.get(
+                "BRIDGE_DIRECTIONS",
+                ["horizontal", "vertical"],
+            )
+            self.need_bridge_iterations = int(need_aux_cfg.get("BRIDGE_ITERATIONS", 1))
         self.need_debug_step = 0
 
 
@@ -147,7 +154,15 @@ class PointPillarLossMultiClass(nn.Module):
         soft_mask = F.conv2d(mask, kernel, padding=radius)
         return soft_mask.clamp(0.0, 1.0)
 
-    def _build_target_from_pos_equal_one(self, pos_equal_one, target_shape) -> torch.Tensor:
+    def _build_target_from_pos_equal_one(
+        self,
+        pos_equal_one,
+        target_shape,
+        dilation_kernel_size,
+        use_soft_target,
+        soft_kernel_size,
+        soft_sigma,
+    ) -> torch.Tensor:
         """Build a dense BEV foreground target from anchor positives.
 
         Anchor positives are very sparse, so we first collapse anchors with
@@ -159,8 +174,7 @@ class PointPillarLossMultiClass(nn.Module):
         pos_bev = pos_bev.permute(0, 3, 1, 2).contiguous()
         pos_bev = pos_bev.clamp(0.0, 1.0)
 
-        dilation_kernel = self.dilation_kernel_size
-        
+        dilation_kernel = int(dilation_kernel_size)
         if dilation_kernel > 2:
             pos_bev = F.max_pool2d(
                 pos_bev,
@@ -170,18 +184,18 @@ class PointPillarLossMultiClass(nn.Module):
             )
             pos_bev = pos_bev.clamp(0.0, 1.0)
 
-        if self.use_soft_target:
+        if use_soft_target:
             hard_pos = pos_bev
             pos_bev = self._gaussian_blur_mask(
                 pos_bev,
-                self.soft_kernel_size,
-                self.soft_sigma,
+                soft_kernel_size,
+                soft_sigma,
             )
             pos_bev = torch.maximum(pos_bev, hard_pos).clamp(0.0, 1.0)
 
         target_size = tuple(target_shape[-2:])
         if tuple(pos_bev.shape[-2:]) != target_size:
-            if self.use_soft_target:
+            if use_soft_target:
                 pos_bev = F.interpolate(
                     pos_bev,
                     size=target_size,
@@ -195,6 +209,85 @@ class PointPillarLossMultiClass(nn.Module):
                     mode="nearest",
                 )
         return pos_bev.clamp(0.0, 1.0)
+
+    def _get_need_window_size(self):
+        value = self.need_window_size
+        if isinstance(value, (list, tuple)):
+            assert len(value) == 2
+            return int(value[0]), int(value[1])
+        scalar = int(value)
+        return scalar, scalar
+
+    def _bridge_need_window_target(self, window_target: torch.Tensor) -> torch.Tensor:
+        """Fill 1-window gaps between positive windows along configured axes."""
+        target = window_target.float()
+        directions = set(self.need_bridge_directions or [])
+        for _ in range(max(0, self.need_bridge_iterations)):
+            bridged = target
+            if "horizontal" in directions:
+                padded = F.pad(target, (1, 1, 0, 0), mode="constant", value=0.0)
+                left = padded[:, :, :, :-2]
+                right = padded[:, :, :, 2:]
+                horizontal_bridge = ((left > 0.5) & (right > 0.5)).to(dtype=target.dtype)
+                bridged = torch.maximum(bridged, horizontal_bridge)
+            if "vertical" in directions:
+                padded = F.pad(target, (0, 0, 1, 1), mode="constant", value=0.0)
+                up = padded[:, :, :-2, :]
+                down = padded[:, :, 2:, :]
+                vertical_bridge = ((up > 0.5) & (down > 0.5)).to(dtype=target.dtype)
+                bridged = torch.maximum(bridged, vertical_bridge)
+            target = bridged
+        return target.clamp(0.0, 1.0)
+
+    def _build_need_window_target_from_pos_equal_one(
+        self,
+        pos_equal_one: torch.Tensor,
+        need_shape: torch.Size,
+    ) -> torch.Tensor:
+        """Build window-expanded need target aligned with WindowRouter routing."""
+        pos_bev = pos_equal_one.float().amax(dim=-1, keepdim=True)
+        pos_bev = pos_bev.permute(0, 3, 1, 2).contiguous()
+        pos_bev = pos_bev.clamp(0.0, 1.0)
+
+        target_h, target_w = int(need_shape[-2]), int(need_shape[-1])
+        if tuple(pos_bev.shape[-2:]) != (target_h, target_w):
+            pos_bev = F.interpolate(
+                pos_bev,
+                size=(target_h, target_w),
+                mode="nearest",
+            )
+
+        window_h, window_w = self._get_need_window_size()
+        pad_h = (window_h - (target_h % window_h)) % window_h
+        pad_w = (window_w - (target_w % window_w)) % window_w
+        if pad_h > 0 or pad_w > 0:
+            pos_bev = F.pad(pos_bev, (0, pad_w, 0, pad_h), mode="constant", value=0.0)
+
+        batch_size, _, padded_h, padded_w = pos_bev.shape
+        num_win_h = padded_h // window_h
+        num_win_w = padded_w // window_w
+        windows = pos_bev.reshape(
+            batch_size,
+            1,
+            num_win_h,
+            window_h,
+            num_win_w,
+            window_w,
+        )
+        window_target = windows.amax(dim=(3, 5))
+        window_target = window_target.clamp(0.0, 1.0)
+
+        if self.need_bridge_one_window_gap:
+            window_target = self._bridge_need_window_target(window_target)
+
+        pixel_target = (
+            window_target.repeat_interleave(window_h, dim=2)
+            .repeat_interleave(window_w, dim=3)
+        )
+        pixel_target = pixel_target[:, :, :target_h, :target_w]
+        pixel_target = pixel_target.clamp(0.0, 1.0)
+
+        return pixel_target
 
     def _focal_bce_prob_loss(
         self,
@@ -246,21 +339,21 @@ class PointPillarLossMultiClass(nn.Module):
             mask = F.interpolate(mask, size=gate_shape[-2:], mode="nearest")
         return mask
 
-    def _positive_prob_loss(self, pred, positive_weight):
+    def _positive_prob_loss(self, pred, positive_weight, loss_type, aux_gamma):
         """Positive-only auxiliary loss that raises gate on visible foreground."""
         weight_sum = positive_weight.sum()
         if float(weight_sum.detach().item()) <= 0.0:
             return None
         pred = pred.clamp(1e-4, 1.0 - 1e-4)
         pos_bce = -torch.log(pred)
-        if self.loss_type == "bce":
+        if loss_type == "bce":
             loss_map = pos_bce
         else:
-            focal_weight = (1.0 - pred).pow(self.aux_gamma)
+            focal_weight = (1.0 - pred).pow(aux_gamma)
             loss_map = pos_bce * focal_weight
         return (loss_map * positive_weight).sum() / torch.clamp(weight_sum, min=1.0)
 
-    def _negative_prob_loss(self, pred, negative_mask):
+    def _negative_prob_loss(self, pred, negative_mask, loss_type, aux_gamma):
         """Negative auxiliary loss that lowers gate on masked regions."""
         weight = negative_mask.float().detach()
         weight_sum = weight.sum()
@@ -268,15 +361,21 @@ class PointPillarLossMultiClass(nn.Module):
             return None
         pred = pred.clamp(1e-4, 1.0 - 1e-4)
         neg_bce = -torch.log(1.0 - pred)
-        if self.loss_type == "bce":
+        if loss_type == "bce":
             loss_map = neg_bce
         else:
-            focal_weight = pred.pow(self.aux_gamma)
+            focal_weight = pred.pow(aux_gamma)
             loss_map = neg_bce * focal_weight
         return (loss_map * weight).sum() / torch.clamp(weight_sum, min=1.0)
 
-    def _compute_need_foreground_aux_loss(self, fusion_aux_outputs, pos_equal_one, target_dict, current_epoch):
-        """Compute optional foreground auxiliary loss for temporal need map."""
+    def _compute_need_foreground_aux_loss(self, fusion_aux_outputs, pos_equal_one, current_epoch):
+        """Compute optional foreground auxiliary loss for temporal need map.
+
+        need_map reflects whether a window needs temporal (historical) information,
+        which is independent of per-source (RSU/Drone) spatial visibility. The
+        positive target is built from ground-truth foreground windows; all remaining
+        non-foreground windows are treated as negatives uniformly.
+        """
         if not isinstance(fusion_aux_outputs, dict):
             return None
 
@@ -292,10 +391,21 @@ class PointPillarLossMultiClass(nn.Module):
             return need_map.new_zeros(())
 
         need = need_map
-        need_target = self._build_target_from_pos_equal_one(
-            pos_equal_one.to(device=need.device, dtype=need.dtype),
-            need.shape,
-        ).detach()
+        pos_equal_one_on_device = pos_equal_one.to(device=need.device, dtype=need.dtype)
+        if getattr(self, "need_target_type", "window") == "window":
+            need_target = self._build_need_window_target_from_pos_equal_one(
+                pos_equal_one_on_device,
+                need.shape,
+            ).detach()
+        else:
+            need_target = self._build_target_from_pos_equal_one(
+                pos_equal_one_on_device,
+                need.shape,
+                dilation_kernel_size=self.need_dilation_kernel_size,
+                use_soft_target=self.need_use_soft_target,
+                soft_kernel_size=self.need_soft_kernel_size,
+                soft_sigma=self.need_soft_sigma,
+            ).detach()
 
         positive_weight = need_target.detach()
         non_fg = (need_target <= 0.0).detach()
@@ -303,60 +413,35 @@ class PointPillarLossMultiClass(nn.Module):
         pos_loss = self._positive_prob_loss(
             pred=need,
             positive_weight=positive_weight,
+            loss_type=self.need_loss_type,
+            aux_gamma=self.need_aux_gamma,
         )
         if pos_loss is None:
             pos_loss = need.new_zeros(())
 
-        source_visibility_masks = {
-            "rsu": target_dict.get("gate_visibility_extent_rsu", None),
-            "drone": target_dict.get("gate_visibility_extent_drone", None),
-        }
-        invisible_neg_masks = {}
-        invisible_neg_losses = {}
-        for source_name, visibility_extent in source_visibility_masks.items():
-            visibility = self._build_visibility_mask_from_extent(visibility_extent, pos_equal_one, need.shape, need.device, need.dtype)
-            if visibility is None:
-                continue
-
-            visibility = visibility.to(device=need.device, dtype=need.dtype).detach()
-            invisible_neg_mask = (non_fg & (visibility <= 0.0)).detach()
-            invisible_neg_loss = self._negative_prob_loss(
-                pred=need,
-                negative_mask=invisible_neg_mask,
-            )
-            if invisible_neg_loss is None:
-                invisible_neg_loss = need.new_zeros(())
-
-            invisible_neg_masks[source_name] = invisible_neg_mask
-            invisible_neg_losses[source_name] = invisible_neg_loss
-
-        rsu_neg_loss = invisible_neg_losses.get("rsu", need.new_zeros(()))
-        drone_neg_loss = invisible_neg_losses.get("drone", need.new_zeros(()))
+        neg_loss = self._negative_prob_loss(
+            pred=need,
+            negative_mask=non_fg,
+            loss_type=self.need_loss_type,
+            aux_gamma=self.need_aux_gamma,
+        )
+        if neg_loss is None:
+            neg_loss = need.new_zeros(())
 
         loss_need_aux = (
             self.need_foreground_pos_weight * pos_loss
-            + self.need_foreground_neg_rsu_invisible_weight * rsu_neg_loss
-            + self.need_foreground_neg_drone_invisible_weight * drone_neg_loss
+            + self.need_foreground_neg_weight * neg_loss
         )
 
-        if self.need_debug_step % 100 == 0:
-            rsu_neg_count = 0
-            if isinstance(invisible_neg_masks.get("rsu", None), torch.Tensor):
-                rsu_neg_count = int(invisible_neg_masks["rsu"].sum().detach().item())
-            drone_neg_count = 0
-            if isinstance(invisible_neg_masks.get("drone", None), torch.Tensor):
-                drone_neg_count = int(invisible_neg_masks["drone"].sum().detach().item())
+        if self.need_debug_step % 5 == 0:
+            total_pixels = need.numel()
+            fg_pixels = int((positive_weight > 0.0).sum().detach().item())
             print(
                 f"[NeedAux] "
-                f"need_map mean={need.mean().item():.6f} "
-                f"positive_weight.sum()={positive_weight.sum().item():.2f} "
-                f"rsu_invisible_neg_count={rsu_neg_count} "
-                f"drone_invisible_neg_count={drone_neg_count} "
+                f"fg={fg_pixels}/{total_pixels} "
                 f"pos_loss={pos_loss.item():.6f} "
-                f"rsu_neg_loss={rsu_neg_loss.item():.6f} "
-                f"drone_neg_loss={drone_neg_loss.item():.6f} "
+                f"neg_loss={neg_loss.item():.6f}"
             )
-        self.need_debug_step += 1
 
         return loss_need_aux * effective_weight
 
@@ -384,6 +469,10 @@ class PointPillarLossMultiClass(nn.Module):
         gate_target = self._build_target_from_pos_equal_one(
             pos_equal_one.to(device=reference_gate.device, dtype=reference_gate.dtype),
             reference_gate.shape,
+            dilation_kernel_size=self.gate_dilation_kernel_size,
+            use_soft_target=self.gate_use_soft_target,
+            soft_kernel_size=self.gate_soft_kernel_size,
+            soft_sigma=self.gate_soft_sigma,
         ).detach()
 
         loss_items = []
@@ -409,14 +498,20 @@ class PointPillarLossMultiClass(nn.Module):
             pos_loss = self._positive_prob_loss(
                 pred=gate,
                 positive_weight=positive_weight,
+                loss_type=self.gate_loss_type,
+                aux_gamma=self.gate_aux_gamma,
             )
             visible_neg_loss = self._negative_prob_loss(
                 pred=gate,
                 negative_mask=visible_neg_mask,
+                loss_type=self.gate_loss_type,
+                aux_gamma=self.gate_aux_gamma,
             )
             invisible_neg_loss = self._negative_prob_loss(
                 pred=gate,
                 negative_mask=invisible_neg_mask,
+                loss_type=self.gate_loss_type,
+                aux_gamma=self.gate_aux_gamma,
             )
 
             if pos_loss is None:
@@ -661,7 +756,7 @@ class PointPillarLossMultiClass(nn.Module):
         det_loss_for_gate_debug = total_loss
 
         current_epoch = output_dict.get("epoch", target_dict.get("epoch", 9999))
-        ############ Gate auxiliary loss ############
+        ############ Gate auxiliary loss #############################################################
         if self.gate_aux_enabled and current_epoch < self.gate_warmup_epochs:
             fusion_gate_outputs = output_dict.get("fusion_gate_outputs", None)
             
@@ -682,7 +777,7 @@ class PointPillarLossMultiClass(nn.Module):
             if (
                 isinstance(fusion_gate_outputs, dict)
                 and gate_aux_loss is not None
-                and self.gate_debug_step % 50 == 0
+                and self.gate_debug_step % 30 == 0
             ):
                 gate_rsu = fusion_gate_outputs.get("gate_rsu", None)
                 gate_drone = fusion_gate_outputs.get("gate_drone", None)
@@ -695,6 +790,10 @@ class PointPillarLossMultiClass(nn.Module):
                             dtype=ref_gate.dtype,
                         ),
                         ref_gate.shape,
+                        dilation_kernel_size=self.gate_dilation_kernel_size,
+                        use_soft_target=self.gate_use_soft_target,
+                        soft_kernel_size=self.gate_soft_kernel_size,
+                        soft_sigma=self.gate_soft_sigma,
                     ).detach()
 
                     if isinstance(gate_rsu, torch.Tensor):
@@ -759,19 +858,50 @@ class PointPillarLossMultiClass(nn.Module):
         else:
             gate_aux_loss = None
 
-        ############ Need auxiliary loss ############
+        ############ Need auxiliary loss #############################################################
         if self.need_aux_enabled and current_epoch < self.need_aux_warmup_epochs:
             fusion_aux_outputs = output_dict.get("fusion_aux_outputs", None)
             
             need_aux_loss = self._compute_need_foreground_aux_loss(
                 fusion_aux_outputs=fusion_aux_outputs,
                 pos_equal_one=pos_mask,
-                target_dict=target_dict,
                 current_epoch=current_epoch,
             )
         
             if need_aux_loss is not None:
                 total_loss = total_loss + need_aux_loss
+
+            # ===== Need gradient direction debug =====
+            if (
+                isinstance(fusion_aux_outputs, dict)
+                and need_aux_loss is not None
+                and self.need_debug_step % 30 == 0
+            ):
+                need_map_debug = fusion_aux_outputs.get("need_map", None)
+                if isinstance(need_map_debug, torch.Tensor) and need_map_debug.requires_grad:
+                    if getattr(self, "need_target_type", "window") == "window":
+                        need_fg_target_debug = self._build_need_window_target_from_pos_equal_one(
+                            pos_mask.to(device=need_map_debug.device, dtype=need_map_debug.dtype),
+                            need_map_debug.shape,
+                        ).detach()
+                    else:
+                        need_fg_target_debug = self._build_target_from_pos_equal_one(
+                            pos_mask.to(device=need_map_debug.device, dtype=need_map_debug.dtype),
+                            need_map_debug.shape,
+                            dilation_kernel_size=self.need_dilation_kernel_size,
+                            use_soft_target=self.need_use_soft_target,
+                            soft_kernel_size=self.need_soft_kernel_size,
+                            soft_sigma=self.need_soft_sigma,
+                        ).detach()
+                    self._debug_gate_grad_by_region(
+                        gate=need_map_debug,
+                        target=need_fg_target_debug,
+                        det_loss=det_loss_for_gate_debug,
+                        aux_loss=need_aux_loss,
+                        name="need",
+                    )
+            # ==========================================
+            self.need_debug_step += 1
         else:
             need_aux_loss = None
 

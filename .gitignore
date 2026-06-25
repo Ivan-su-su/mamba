@@ -201,3 +201,14 @@ opencood/**/build/**/*.so
 opencood/models/mambafusion_modules/ckpts/hilbert_template/*.pth
 opencood/models/mambafusion_modules/ckpts/hilbert_template/*.pth
 opencood/models/mambafusion_modules/ckpts/hilbert_template/*.pth
+__pycache__/
+*.pyc
+*.pyo
+*.log
+wandb/
+runs/
+outputs/
+checkpoints/
+*.pth
+*.pt
+*.ckpt

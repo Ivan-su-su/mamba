@@ -9,6 +9,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from opencood.models.common_modules.torch_transformation_utils import (
+    warp_affine_simple,
+)
+
 
 # from opencood.models.fuse_modules.self_attn import ScaledDotProductAttention
 class ScaledDotProductAttention(nn.Module):
@@ -194,6 +198,40 @@ class Where2comm(nn.Module):
         split_x = torch.tensor_split(x, cum_sum_len[:-1].cpu())
         return split_x
 
+    def normalize_pairwise_t_matrix(self, pairwise_t_matrix, H, W):
+        """Convert 4x4 pose matrices to 2x3 affine grids for BEV warping."""
+        affine_matrix = pairwise_t_matrix[:, :, :, [0, 1], :][:, :, :, :, [0, 1, 3]]
+        affine_matrix = affine_matrix.clone()
+        affine_matrix[..., 0, 1] = affine_matrix[..., 0, 1] * H / W
+        affine_matrix[..., 1, 0] = affine_matrix[..., 1, 0] * W / H
+        affine_matrix[..., 0, 2] = (
+            affine_matrix[..., 0, 2]
+            / (self.downsample_rate * self.discrete_ratio * W)
+            * 2
+        )
+        affine_matrix[..., 1, 2] = (
+            affine_matrix[..., 1, 2]
+            / (self.downsample_rate * self.discrete_ratio * H)
+            * 2
+        )
+        return affine_matrix
+
+    def warp_to_ego(self, node_features, pairwise_t_matrix, record_len, H, W):
+        """Warp collaborator BEV features into the ego (index 0) coordinate frame."""
+        B = pairwise_t_matrix.shape[0]
+        affine_matrix = self.normalize_pairwise_t_matrix(pairwise_t_matrix, H, W)
+        batch_node_features = self.regroup(node_features, record_len)
+        warped_features = []
+        for b in range(B):
+            n_cav = record_len[b]
+            t_matrix = affine_matrix[b][:n_cav, :n_cav, :, :]
+            warped_features.append(
+                warp_affine_simple(
+                    batch_node_features[b], t_matrix[0, :, :, :], (H, W)
+                )
+            )
+        return warped_features
+
     def forward(self, x, psm_single, record_len, pairwise_t_matrix, backbone=None):
         """
         Fusion forwarding.
@@ -239,13 +277,15 @@ class Where2comm(nn.Module):
                 # split_x: [(L1, C, H, W), (L2, C, H, W), ...]
                 # For example [[2, 256, 48, 176], [1, 256, 48, 176], ...]
                 
-                batch_node_features = self.regroup(x, record_len)
+                _, _, level_h, level_w = x.shape
+                warped_features = self.warp_to_ego(
+                    x, pairwise_t_matrix, record_len, level_h, level_w
+                )
 
                 # 3. Fusion
                 x_fuse = []
                 for b in range(B):
-                    neighbor_feature = batch_node_features[b]
-                    x_fuse.append(self.fuse_modules[i](neighbor_feature))
+                    x_fuse.append(self.fuse_modules[i](warped_features[b]))
                 x_fuse = torch.stack(x_fuse)
 
                 # 4. Deconv
@@ -276,12 +316,13 @@ class Where2comm(nn.Module):
             # 2. Split the features
             # split_x: [(L1, C, H, W), (L2, C, H, W), ...]
             # For example [[2, 256, 48, 176], [1, 256, 48, 176], ...]
-            batch_node_features = self.regroup(x, record_len)
+            warped_features = self.warp_to_ego(
+                x, pairwise_t_matrix, record_len, H, W
+            )
 
             # 3. Fusion
             x_fuse = []
             for b in range(B):
-                neighbor_feature = batch_node_features[b]
-                x_fuse.append(self.fuse_modules(neighbor_feature))
+                x_fuse.append(self.fuse_modules(warped_features[b]))
             x_fuse = torch.stack(x_fuse)
         return x_fuse, communication_rates

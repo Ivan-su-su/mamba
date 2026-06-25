@@ -616,6 +616,10 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
                 semantic_gt = self._load_image_semantic_gt(camera_path)  # [720, 1280]
             camera_to_lidar = camera_to_lidar_matrix[idx]
             camera_to_lidar = camera_utils.ue4_to_lss(camera_to_lidar)
+            # Align camera BEV with proj_first LiDAR features in ego LiDAR frame.
+            if self.proj_first and self.use_cam:
+                agent_to_ego = transformation_matrix.astype(np.float32)
+                camera_to_lidar = agent_to_ego @ camera_to_lidar
             camera_intrinsic = camera_intrinsics[idx]
             intrin = torch.from_numpy(camera_intrinsic)
             rot = torch.from_numpy(camera_to_lidar[:3, :3])  # R_wc, we consider world-coord is the lidar-coord

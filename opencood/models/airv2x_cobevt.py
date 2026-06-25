@@ -34,7 +34,10 @@ class Airv2xCoBEVT(Airv2xBase):
         
         self.init_encoders(args)
 
-        self.backbone = BaseBEVBackbone(args["base_bev_backbone"], 64)
+        self.encoder_out_channels = self._fused_encoder_channels()
+        self.backbone = BaseBEVBackbone(
+            args["base_bev_backbone"], self.encoder_out_channels
+        )
 
         # used to downsample the feature map for efficient computation
         self.shrink_flag = False
@@ -72,18 +75,39 @@ class Airv2xCoBEVT(Airv2xBase):
         if args["backbone_fix"]:
             self.backbone_fix()
 
+    def _fused_encoder_channels(self):
+        """64 channels per modality; concat yields 64 * num_modalities."""
+        modality_counts = []
+        for models in (self.veh_models, self.rsu_models, self.drone_models):
+            if models is not None and len(models) > 0:
+                modality_counts.append(len(models))
+        if not modality_counts:
+            return 64
+        return 64 * max(modality_counts)
+
+    def fuse_bev(self, batch_dict_list):
+        """Concatenate multi-modal BEV features along the channel dimension."""
+        if len(batch_dict_list) == 1:
+            return {"spatial_features": batch_dict_list[0]["spatial_features"]}
+        return {
+            "spatial_features": torch.cat(
+                [batch_dict["spatial_features"] for batch_dict in batch_dict_list],
+                dim=1,
+            )
+        }
+
     def backbone_fix(self):
         """
         Fix the parameters of backbone during finetune on timedelay。
         """
         if "vehicle" in self.collaborators:
-            for p in self.veh_model.parameters():
+            for p in self.veh_models.parameters():
                 p.requires_grad = False
         if "rsu" in self.collaborators:
-            for p in self.rsu_model.parameters():
+            for p in self.rsu_models.parameters():
                 p.requires_grad = False
         if "drone" in self.collaborators:
-            for p in self.drone_model.parameters():
+            for p in self.drone_models.parameters():
                 p.requires_grad = False
 
         for p in self.backbone.parameters():

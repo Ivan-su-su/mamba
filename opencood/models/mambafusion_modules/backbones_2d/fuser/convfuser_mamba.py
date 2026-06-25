@@ -1,6 +1,8 @@
+import random
+
 import torch
 from torch import nn
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import math
 
 from ...vmamba.vmamba import SS2D, VSSBlock, Linear2d, LayerNorm2d
@@ -112,8 +114,9 @@ class ConvFuser(nn.Module):
                     'SAMPLE_DA_LAYER_SCALE_INIT', 1e-2
                 ),
                 final_gate_hidden_dim=fusion_cfg.get('FINAL_GATE_HIDDEN_DIM', 32),
+                gate_head_cfg=fusion_cfg.get('GATE_HEAD', {}),
                 sparse_temporal_cfg=sparse_temporal_cfg,
-                gate_alpha_cfg=fusion_cfg.get('GATE_ALPHA', {}),
+                gate_topk_cfg=fusion_cfg.get('GATE_TOPK', {}),
             )
         if self.use_merge_after:
             depths = [1]
@@ -1135,6 +1138,86 @@ class CueBasedFinalGateHead(nn.Module):
         return torch.sigmoid(self.head(x))
 
 
+class ForegroundReliabilityGateHead(nn.Module):
+    """Predict ego-centric gates from refined features and reliability cues."""
+
+    def __init__(
+        self,
+        channels: int = 128,
+        feature_mid_channels: int = 32,
+        feature_out_channels: int = 16,
+        reliability_in_channels: int = 3,
+        reliability_out_channels: int = 4,
+        gate_hidden_channels: int = 16,
+        drop_rate: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.feature_descriptor = nn.Sequential(
+            nn.Conv2d(channels, feature_mid_channels, kernel_size=3, padding=1, bias=False),
+            LayerNorm2d(feature_mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                feature_mid_channels,
+                feature_mid_channels,
+                kernel_size=3,
+                padding=1,
+                groups=feature_mid_channels,
+                bias=False,
+            ),
+            nn.Conv2d(feature_mid_channels, feature_out_channels, kernel_size=1, bias=False),
+            LayerNorm2d(feature_out_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.reliability_descriptor = nn.Sequential(
+            nn.Conv2d(reliability_in_channels, reliability_out_channels, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+        )
+        gate_layers: List[nn.Module] = [
+            nn.Conv2d(
+                feature_out_channels + reliability_out_channels,
+                gate_hidden_channels,
+                kernel_size=1,
+                bias=False,
+            ),
+            nn.ReLU(inplace=True),
+        ]
+        if drop_rate > 0.0:
+            gate_layers.append(nn.Dropout2d(drop_rate))
+        gate_layers.append(nn.Conv2d(gate_hidden_channels, 1, kernel_size=1, bias=True))
+        self.gate_head = nn.Sequential(*gate_layers)
+        nn.init.constant_(self.gate_head[-1].bias, 0.0)
+
+    def forward(
+        self,
+        refined_feature: torch.Tensor,
+        reliability_cues: Dict[str, torch.Tensor],
+        return_debug: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        feature_desc = self.feature_descriptor(refined_feature)
+        reliability_input = torch.cat(
+            [
+                reliability_cues['attention_conf'],
+                reliability_cues['mean_offset'],
+                reliability_cues['sample_agree'],
+            ],
+            dim=1,
+        )
+        reliability_desc = self.reliability_descriptor(reliability_input)
+        gate_input = torch.cat([feature_desc, reliability_desc], dim=1)
+        gate_logit = self.gate_head(gate_input)
+        gate = torch.sigmoid(gate_logit)
+        if return_debug:
+            return gate, {
+                'feature_descriptor_mean': feature_desc.mean(dim=1, keepdim=True),
+                'feature_descriptor_norm': torch.norm(feature_desc, dim=1, keepdim=True),
+                'reliability_descriptor_mean': reliability_desc.mean(dim=1, keepdim=True),
+                'attention_conf': reliability_cues['attention_conf'],
+                'mean_offset': reliability_cues['mean_offset'],
+                'sample_agree': reliability_cues['sample_agree'],
+            }
+        return gate
+
+
 class GeometricTransmissionGate(nn.Module):
     """Convert offset magnitude into geometric transmission weights."""
 
@@ -1794,8 +1877,9 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
         sample_da_drop_rate: float = 0.1,
         sample_da_layer_scale_init: float = 1e-2,
         final_gate_hidden_dim: int = 32,
+        gate_head_cfg: Optional[Dict[str, Any]] = None,
         sparse_temporal_cfg: Optional[Dict[str, Any]] = None,
-        gate_alpha_cfg: Optional[Dict[str, Any]] = None,
+        gate_topk_cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Initialize the selective hierarchical fusion block.
 
@@ -1824,7 +1908,7 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
             sample_da_layer_scale_init: DA attention layer scale init.
             final_gate_hidden_dim: Hidden channel count of the final gate head.
             sparse_temporal_cfg: Optional sparse temporal refinement config.
-            gate_alpha_cfg: Optional gate alpha config.
+            gate_topk_cfg: Optional gate topk config.
         """
         super().__init__()
         self.num_points = num_points
@@ -1873,28 +1957,25 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
             padding_mode=padding_mode,
         )
         self.transmission_gate = GeometricTransmissionGate(alpha=transmission_alpha)
-        objectness_hidden = max(channels // 2, 16)
-        self.objectness_heads = nn.ModuleDict(
-            {
-                name: nn.Sequential(
-                    nn.Conv2d(channels, objectness_hidden, kernel_size=3, padding=1, bias=False),
-                    LayerNorm2d(objectness_hidden),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(objectness_hidden, 1, kernel_size=1, bias=True),
-                )
-                for name in ['vehicle', 'rsu', 'drone']
-            }
-        )
+        gate_head_cfg = gate_head_cfg or {}
         self.final_gate_heads = nn.ModuleDict(
             {
-                'rsu': CueBasedFinalGateHead(
-                    in_channels=7,
-                    hidden_channels=final_gate_hidden_dim,
+                'rsu': ForegroundReliabilityGateHead(
+                    channels=channels,
+                    feature_mid_channels=gate_head_cfg.get('FEATURE_MID_CHANNELS', 32),
+                    feature_out_channels=gate_head_cfg.get('FEATURE_OUT_CHANNELS', 16),
+                    reliability_in_channels=3,
+                    reliability_out_channels=gate_head_cfg.get('RELIABILITY_OUT_CHANNELS', 4),
+                    gate_hidden_channels=gate_head_cfg.get('GATE_HIDDEN_CHANNELS', 16),
                     drop_rate=sample_da_drop_rate,
                 ),
-                'drone': CueBasedFinalGateHead(
-                    in_channels=7,
-                    hidden_channels=final_gate_hidden_dim,
+                'drone': ForegroundReliabilityGateHead(
+                    channels=channels,
+                    feature_mid_channels=gate_head_cfg.get('FEATURE_MID_CHANNELS', 32),
+                    feature_out_channels=gate_head_cfg.get('FEATURE_OUT_CHANNELS', 16),
+                    reliability_in_channels=3,
+                    reliability_out_channels=gate_head_cfg.get('RELIABILITY_OUT_CHANNELS', 4),
+                    gate_hidden_channels=gate_head_cfg.get('GATE_HIDDEN_CHANNELS', 16),
                     drop_rate=sample_da_drop_rate,
                 ),
             }
@@ -1941,8 +2022,15 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
                 window_size=sparse_temporal_cfg.get('ROUTE_WINDOW', window_size),
                 need_topk=sparse_temporal_cfg.get('TOPK'),
                 need_threshold=sparse_temporal_cfg.get('NEED_THRESHOLD', 0.5),
-                need_smoothing_kernel_size=sparse_temporal_cfg.get('SMOOTHING_KERNEL_SIZE', 3),
+                need_smoothing_kernel_size=sparse_temporal_cfg.get(
+                    'NEED_SMOOTHING_KERNEL_SIZE',
+                    sparse_temporal_cfg.get('SMOOTHING_KERNEL_SIZE', 1),
+                ),
                 need_init_bias=sparse_temporal_cfg.get('NEED_INIT_BIAS', 0.25),
+                need_feature_channels=sparse_temporal_cfg.get('NEED_FEATURE_CHANNELS', 16),
+                need_residual_channels=sparse_temporal_cfg.get('NEED_RESIDUAL_CHANNELS', 16),
+                need_prior_clamp_min=sparse_temporal_cfg.get('NEED_PRIOR_CLAMP_MIN', 0.01),
+                need_prior_clamp_max=sparse_temporal_cfg.get('NEED_PRIOR_CLAMP_MAX', 0.99),
                 residual_offset_range=sparse_temporal_cfg.get('RESIDUAL_OFFSET_RANGE', offset_range),
                 base_scale_multiplier=sparse_temporal_cfg.get('BASE_SCALE_MULTIPLIER', 1.0),
                 base_scale_min=sparse_temporal_cfg.get('BASE_SCALE_MIN', 1.0),
@@ -1958,34 +2046,46 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
             )
         else:
             self.sparse_temporal_fusion = None
-        gate_alpha_cfg = gate_alpha_cfg or {}
-        self.gate_alpha_enabled = bool(gate_alpha_cfg.get("ENABLED", False))
-        self.gate_alpha_warmup_epochs = int(gate_alpha_cfg.get("WARMUP_EPOCHS", 3))
-        self.gate_alpha_list = gate_alpha_cfg.get("ALPHA_LIST", [0.2, 0.5, 0.8])
+        gate_topk_cfg = gate_topk_cfg or {}
+        self.gate_topk_enabled = bool(gate_topk_cfg.get("TOPK_ENABLED", True))
+        self.gate_inference_threshold = float(
+            gate_topk_cfg.get("INFERENCE_THRESHOLD", 0.7)
+        )
         self.grad_debug_step = 0
         self.gate_vis_counter = 0
+        self.gate_vis_epoch = None
 
-    def _apply_gate_alpha(
-        self,
-        gate: Optional[torch.Tensor],
-        alpha: float,
-    ) -> Optional[torch.Tensor]:
-        """Blend toward 1.0 early in training; fusion-only, gradients preserved."""
-        if gate is None:
-            return None
-        if not self.gate_alpha_enabled or alpha >= 1.0:
+    def _apply_gate_topk(self, gate: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Binarize gate for fusion: top-K pixels pass full features (where2comm-style)."""
+        if gate is None or not self.gate_topk_enabled:
             return gate
-        return (1.0 - alpha) + alpha * gate
+
+        batch_size, _, height, width = gate.shape
+        flat_gate = gate.reshape(batch_size, -1)
+
+        if self.training:
+            k = int(height * width * 0.05)   #TODO: 这里的k是随机生成的，需要根据实际情况调整
+            if k <= 0:
+                hard_mask = torch.zeros_like(gate)
+            else:
+                k = min(k, flat_gate.shape[-1])
+                _, indices = torch.topk(flat_gate, k=k, dim=-1, sorted=False)
+                binary_flat = torch.zeros_like(flat_gate)
+                binary_flat.scatter_(-1, indices, 1.0)
+                hard_mask = binary_flat.reshape(batch_size, 1, height, width)
+            # STE keeps gate_head trainable while forward uses hard top-K mask.
+            return hard_mask + gate - gate.detach()
+
+        return (gate > self.gate_inference_threshold).to(gate.dtype)
 
     def _maybe_print_gate_schedule_debug(
         self,
         gate_outputs: Dict[str, Optional[torch.Tensor]],
         epoch: Optional[int] = None,
-        alpha: Optional[float] = None,
     ) -> None:
         if not self.training:
             return
-        print(f"[GateSchedule] epoch={epoch}, alpha={alpha:.4f}")
+        print(f"[GateSchedule] epoch={epoch}")
         for name, gate in (("rsu", gate_outputs.get("gate_rsu")), ("drone", gate_outputs.get("gate_drone"))):
             if not isinstance(gate, torch.Tensor):
                 continue
@@ -2002,46 +2102,46 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
         self,
         batch_dict: Optional[Dict[str, Any]],
         gate_outputs: Dict[str, Optional[torch.Tensor]],
+        gate_inputs: Optional[Dict[str, Optional[Dict[str, torch.Tensor]]]] = None,
+        gate_fusion_outputs: Optional[Dict[str, Optional[torch.Tensor]]] = None,
     ) -> None:
-        """Save RSU / Drone final gate maps during training only (hard-coded paths)."""
+        """Save RSU / Drone final gate maps and selected structured gate inputs."""
         if not self.training:
             return
         if batch_dict is None:
             return
 
-        save_dir = "./gate_map_visualization"
+        save_dir = "./map_gate_visualization"
         max_samples_per_batch = 2
         dpi = 150
         cmap = "viridis"
 
-        self.gate_vis_counter += 1
-
         epoch_raw = batch_dict.get("epoch")
+        epoch_num = None
         if epoch_raw is None:
             epoch_str = "unknown"
         elif isinstance(epoch_raw, torch.Tensor):
-            epoch_str = str(int(epoch_raw.detach().cpu().item()))
+            epoch_num = int(epoch_raw.detach().cpu().item())
+            epoch_str = str(epoch_num)
         elif isinstance(epoch_raw, float) and epoch_raw.is_integer():
-            epoch_str = str(int(epoch_raw))
+            epoch_num = int(epoch_raw)
+            epoch_str = str(epoch_num)
         elif isinstance(epoch_raw, int):
+            epoch_num = epoch_raw
             epoch_str = str(epoch_raw)
         else:
             epoch_str = str(epoch_raw)
-
-        step_raw = batch_dict.get("global_step")
-        if step_raw is None:
-            step_raw = batch_dict.get("step")
-        if step_raw is None:
-            step_raw = batch_dict.get("iteration")
-        if step_raw is None:
-            step_raw = self.gate_vis_counter
-        if isinstance(step_raw, torch.Tensor):
-            step_num = int(step_raw.detach().cpu().item())
-        else:
             try:
-                step_num = int(step_raw)
+                epoch_num = int(epoch_raw)
             except (TypeError, ValueError):
-                step_num = self.gate_vis_counter
+                epoch_num = None
+
+        if epoch_num is not None and self.gate_vis_epoch != epoch_num:
+            self.gate_vis_epoch = epoch_num
+            self.gate_vis_counter = 0
+
+        step_num = self.gate_vis_counter
+        self.gate_vis_counter += 1
 
         os.makedirs(save_dir, exist_ok=True)
 
@@ -2053,9 +2153,15 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
         for agent_name, gate_tensor in pairs:
             if gate_tensor is None:
                 continue
+            fusion_gate_tensor = None
+            if self.gate_topk_enabled and gate_fusion_outputs is not None:
+                fusion_gate_tensor = gate_fusion_outputs.get(f"gate_{agent_name}")
             gate_cpu = gate_tensor.detach().float().cpu()
             if gate_cpu.dim() != 4 or gate_cpu.shape[1] != 1:
                 continue
+            input_tensors = None
+            if gate_inputs is not None:
+                input_tensors = gate_inputs.get(f"gate_{agent_name}")
             batch_size = gate_cpu.shape[0]
             n_save = min(batch_size, max_samples_per_batch)
             for sample_idx in range(n_save):
@@ -2074,18 +2180,63 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
                 )
                 save_path = os.path.join(save_dir, fname)
 
-                fig, ax = plt.subplots(
-                    figsize=(6.5, 5.8),
+                panels = []
+                if isinstance(input_tensors, dict):
+                    for input_name in (
+                        "feature_descriptor_mean",
+                        "feature_descriptor_norm",
+                        "reliability_descriptor_mean",
+                    ):
+                        input_tensor = input_tensors.get(input_name)
+                        if not isinstance(input_tensor, torch.Tensor):
+                            continue
+                        input_cpu = input_tensor.detach().float().cpu()
+                        if input_cpu.dim() != 4 or sample_idx >= input_cpu.shape[0]:
+                            continue
+                        if input_cpu.shape[1] == 1:
+                            input_hw = input_cpu[sample_idx, 0]
+                        else:
+                            input_hw = input_cpu[sample_idx].mean(dim=0)
+                        panels.append((input_name, input_hw.numpy(), input_hw))
+                panels.append(("gate_map", gate_np, gate_hw))
+                if isinstance(fusion_gate_tensor, torch.Tensor):
+                    fusion_cpu = fusion_gate_tensor.detach().float().cpu()
+                    if fusion_cpu.dim() == 4 and fusion_cpu.shape[1] == 1 and sample_idx < fusion_cpu.shape[0]:
+                        fusion_hw = fusion_cpu[sample_idx, 0]
+                        panels.append(("g_fusion", fusion_hw.numpy(), fusion_hw))
+
+                fig, axes = plt.subplots(
+                    1,
+                    len(panels),
+                    figsize=(4.0 * len(panels), 4.2),
                     constrained_layout=True,
                 )
-                im = ax.imshow(gate_np, vmin=0.0, vmax=1.0, cmap=cmap)
-                fig.colorbar(im, ax=ax, shrink=0.85)
+                if len(panels) == 1:
+                    axes = [axes]
+                for ax, (panel_name, panel_np, panel_hw) in zip(axes, panels):
+                    if panel_name in (
+                        "gate_map",
+                        "g_fusion",
+                        "feature_descriptor_mean",
+                        "reliability_descriptor_mean",
+                    ):
+                        im = ax.imshow(panel_np, vmin=0.0, vmax=1.0, cmap=cmap)
+                    else:
+                        im = ax.imshow(panel_np, cmap=cmap)
+                    fig.colorbar(im, ax=ax, shrink=0.75)
+                    ax.set_title(
+                        f"{panel_name}\n"
+                        f"mean={panel_hw.mean().item():.4f}, std={panel_hw.std().item():.4f}",
+                        fontsize=8,
+                    )
+                    ax.set_xticks([])
+                    ax.set_yticks([])
                 title = (
                     f"{agent_name}: mean={mean_val:.4f}, min={min_val:.4f}, max={max_val:.4f}, "
                     f"std={std_val:.4f}\n"
                     f"ratio>0.5={ratio_05:.4f}, ratio>0.7={ratio_07:.4f}, ratio>0.9={ratio_09:.4f}"
                 )
-                ax.set_title(title, fontsize=9)
+                fig.suptitle(title, fontsize=9)
                 fig.savefig(save_path, dpi=dpi)
                 plt.close(fig)
 
@@ -2179,25 +2330,16 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
     def _build_structured_final_gate(
         self,
         source_name: str,
-        obj_ext: torch.Tensor,
-        obj_vehicle: torch.Tensor,
+        refined_feature: torch.Tensor,
         reliability_cues: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        """Build final gate from objectness, complementarity, and reliability cues."""
-        gate_input = torch.cat(
-            [
-                obj_ext,
-                obj_vehicle,
-                obj_ext * (1.0 - obj_vehicle),
-                reliability_cues['attention_conf'],
-                reliability_cues['mean_offset'],
-                reliability_cues['sample_agree'],
-                reliability_cues['update_mag'],
-            ],
-            dim=1,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Build final gate from refined features and reliability cues."""
+        final_gate, gate_input_maps = self.final_gate_heads[source_name](
+            refined_feature,
+            reliability_cues,
+            return_debug=True,
         )
-        final_gate = self.final_gate_heads[source_name](gate_input)
-        return final_gate
+        return final_gate, gate_input_maps
 
     @staticmethod
     def _stack_temporal_cue_distance(cue_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -2241,29 +2383,23 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
         source_name: str,
         feature: Optional[torch.Tensor],
         feature_vehicle: torch.Tensor,
-        obj_vehicle: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """Process one optional external source or create final-fusion placeholders."""
         
         if feature is None:
             zero_feature, zero_gate, zero_temporal_cues = self._build_missing_source_placeholders(
                 feature_vehicle
             )
-            return zero_feature, zero_gate, zero_temporal_cues
+            return zero_feature, zero_gate, zero_temporal_cues, {}
         
         source_outputs = self._refine_source(
             source_name,
             feature,
         )
         reliability_cues = self._build_reliability_cues(source_outputs)
-        obj_ext = torch.sigmoid(
-            self.objectness_heads[source_name](source_outputs['refined_feature'])
-        )
-        
-        final_gate = self._build_structured_final_gate(
+        final_gate, gate_input_maps = self._build_structured_final_gate(
             source_name=source_name,
-            obj_ext=obj_ext,
-            obj_vehicle=obj_vehicle,
+            refined_feature=source_outputs['refined_feature'],
             reliability_cues=reliability_cues,
         )
 
@@ -2278,6 +2414,7 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
             source_outputs['refined_feature'],
             final_gate,
             temporal_cue_distance,
+            gate_input_maps,
         )
 
     def forward(
@@ -2316,48 +2453,49 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
 
         vehicle_outputs = self._refine_source('vehicle', feature_vehicle)
         refined_vehicle = vehicle_outputs['refined_feature']
-        obj_vehicle = torch.sigmoid(self.objectness_heads['vehicle'](refined_vehicle))
-        refined_rsu, g_final_rsu, temporal_cue_rsu = self._process_optional_external_source(
+        refined_rsu, g_final_rsu, temporal_cue_rsu, gate_inputs_rsu = self._process_optional_external_source(
             'rsu',
             feature_rsu,
             feature_vehicle,
-            obj_vehicle,
         )
-        refined_drone, g_final_drone, temporal_cue_drone = self._process_optional_external_source(
+        refined_drone, g_final_drone, temporal_cue_drone, gate_inputs_drone = self._process_optional_external_source(
             'drone',
             feature_drone,
             feature_vehicle,
-            obj_vehicle,
         )
         
-        schedule_alpha = 1.0
-        current_epoch = batch_dict.get('epoch', None)
-        if self.training and self.gate_alpha_enabled:
-            schedule_alpha = self.gate_alpha_list[min(current_epoch, self.gate_alpha_warmup_epochs-1)]
+        current_epoch = batch_dict.get('epoch', None) if batch_dict is not None else None
+        g_fusion_rsu = self._apply_gate_topk(g_final_rsu)
+        g_fusion_drone = self._apply_gate_topk(g_final_drone)
 
         if batch_dict is not None:
             batch_dict['fusion_gate_outputs'] = {
                 'gate_rsu': g_final_rsu if feature_rsu is not None else None,
                 'gate_drone': g_final_drone if feature_drone is not None else None,
             }
-            if self.grad_debug_step % 50 == 0:
+            batch_dict['fusion_gate_inputs'] = {
+                'gate_rsu': gate_inputs_rsu if feature_rsu is not None else None,
+                'gate_drone': gate_inputs_drone if feature_drone is not None else None,
+            }
+            if self.grad_debug_step % 30 == 0:
                 # ===== Gate grad debug =====================
                 self._maybe_print_gate_schedule_debug(
                     gate_outputs=batch_dict['fusion_gate_outputs'],
                     epoch=current_epoch,
-                    alpha=schedule_alpha,
                 )
                 # ===============================================
                 # ===== Gate map visualization for debugging =====
                 self._visualize_gate_maps(
                     batch_dict=batch_dict,
                     gate_outputs=batch_dict['fusion_gate_outputs'],
+                    gate_inputs=batch_dict['fusion_gate_inputs'],
+                    gate_fusion_outputs={
+                        'gate_rsu': g_fusion_rsu if feature_rsu is not None else None,
+                        'gate_drone': g_fusion_drone if feature_drone is not None else None,
+                    } if self.gate_topk_enabled else None,
                 )
                 # ===============================================
             self.grad_debug_step += 1
-
-        g_fusion_rsu = self._apply_gate_alpha(g_final_rsu, schedule_alpha)
-        g_fusion_drone = self._apply_gate_alpha(g_final_drone, schedule_alpha)
 
         fused_feature = self.ego_fusion(
             refined_veh=refined_vehicle,
@@ -2379,6 +2517,7 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
                 distance_rsu=temporal_cue_rsu,
                 gate_rsu=g_final_rsu,
                 return_debug=True,
+                epoch=current_epoch,
             )
             if isinstance(temporal_out, tuple):
                 fused_feature, temporal_debug = temporal_out

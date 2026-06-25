@@ -8,7 +8,7 @@
 # export PATH=/usr/local/cuda-12.1/bin:$PATH
 # export LD_LIBRARY_PATH=/usr/local/cuda-12.1/lib64:${LD_LIBRARY_PATH}
 MODEL_DIR="/home/dell/suyi/AirV2X-Perception_copy/AirV2X-Perception-Checkpoints/airv2x_intermediate_mambafusion"
-LOG_DIR='/home/dell/suyi/AirV2X-Perception_copy/opencood/logs/airv2x_intermediate_mambafusion/default_2026_05_18_17_23_18'
+LOG_DIR='/home/dell/suyi/AirV2X-Perception_copy/opencood/logs/airv2x_intermediate_mambafusion/default_2026_06_23_00_52_34'
 # MODEL_DIR="/home/suyi/AirV2X-Perception_old/AirV2X-Perception-Checkpoints/airv2x_intermediate_where2comm/release"
 gpu_spec=${1:-0}
 train=${2:-test}

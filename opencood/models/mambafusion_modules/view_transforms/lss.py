@@ -1885,7 +1885,7 @@ class LSSTransform_Sparse(nn.Module):
                     pillar_y = None
                     pillar_x = None
 
-                joint_map = img_mask_down | pillar_map
+                joint_map = img_mask_down | pillar_map #TODO
                 if joint_map.any():
                     joint_float = joint_map.float().unsqueeze(1)
                     neighbor = F.conv2d(

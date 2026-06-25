@@ -38,7 +38,10 @@ class Airv2xWhere2com(Airv2xBase):
         self.init_encoders(args)
 
         modality_args = args["modality_fusion"]
-        self.backbone = BaseBEVBackbone(modality_args["base_bev_backbone"], 64)
+        self.encoder_out_channels = self._fused_encoder_channels()
+        self.backbone = BaseBEVBackbone(
+            modality_args["base_bev_backbone"], self.encoder_out_channels
+        )
 
         # used to downsample the feature map for efficient computation
         self.shrink_flag = False
@@ -53,6 +56,7 @@ class Airv2xWhere2com(Airv2xBase):
 
         self.fusion_net = Where2comm(args["where2com_fusion"])
         self.multi_scale = args["where2com_fusion"]["multi_scale"]
+        self.proj_first = args.get("proj_first", False)
 
         self.outC = args["outC"]
 
@@ -76,6 +80,27 @@ class Airv2xWhere2com(Airv2xBase):
 
         if args["backbone_fix"]:
             self.backbone_fix()
+
+    def _fused_encoder_channels(self):
+        """64 channels per modality; concat yields 64 * num_modalities."""
+        modality_counts = []
+        for models in (self.veh_models, self.rsu_models, self.drone_models):
+            if models is not None and len(models) > 0:
+                modality_counts.append(len(models))
+        if not modality_counts:
+            return 64
+        return 64 * max(modality_counts)
+
+    def fuse_bev(self, batch_dict_list):
+        """Concatenate multi-modal BEV features along the channel dimension."""
+        if len(batch_dict_list) == 1:
+            return {"spatial_features": batch_dict_list[0]["spatial_features"]}
+        return {
+            "spatial_features": torch.cat(
+                [batch_dict["spatial_features"] for batch_dict in batch_dict_list],
+                dim=1,
+            )
+        }
 
     def backbone_fix(self):
         """
@@ -114,32 +139,31 @@ class Airv2xWhere2com(Airv2xBase):
             for p in self.seg_head.parameters():
                 p.requires_grad = False
 
+    def _get_pairwise_t_matrix(self, data_dict):
+        """
+        Select the pairwise transform used for BEV warping during fusion.
+
+        When proj_first=True, LiDAR and (if enabled) camera features are already
+        expressed in the ego LiDAR frame, so identity pairwise matrices are used.
+        Otherwise, warp collaborators with img_pairwise_t_matrix_collab.
+        """
+        if self.proj_first:
+            return data_dict["pairwise_t_matrix_collab"]
+        return data_dict["img_pairwise_t_matrix_collab"]
+
     def forward(self, data_dict):
         batch_output_dict, batch_record_len = self.extract_features(data_dict)
-        batch_output_dict = self.backbone(batch_output_dict)
+        batch_dict = self.backbone(batch_output_dict)
 
-        batch_spatial_features = batch_output_dict["spatial_features"]
+        batch_spatial_features = batch_dict["spatial_features"]
         comm_rates = batch_spatial_features.count_nonzero().item()
 
-        batch_dict = self.backbone(batch_output_dict)
-        # N, C, H', W'. [N, 256, 50, 176]
         batch_spatial_features_2d = batch_dict["spatial_features_2d"]
-        print(f"[Where2comm] Backbone输出特征图尺寸: {batch_spatial_features_2d.shape}")
-        # camera features are still in its own coordinate system
-        pairwise_t_matrix = data_dict["img_pairwise_t_matrix_collab"]
+        pairwise_t_matrix = self._get_pairwise_t_matrix(data_dict)
 
         # downsample feature to reduce memory
         if self.shrink_flag:
             batch_spatial_features_2d = self.shrink_conv(batch_spatial_features_2d)
-            print(f"[Where2comm] Shrink后特征图尺寸: {batch_spatial_features_2d.shape}")
-            
-        
-            
-        # import pdb; pdb.set_trace()
-        feat = batch_spatial_features_2d[0].mean(0).detach().cpu().numpy()
-        import cv2; import numpy as np
-        cv2.imwrite("debug/debug_image_bevfeat.png", ((feat - feat.min()) / (feat.max() - feat.min()) * 255).astype(np.uint8),)
-        
 
         output_dict = {}
         if self.args["task"] == "det":
@@ -169,13 +193,11 @@ class Airv2xWhere2com(Airv2xBase):
 
             psm = self.cls_head(fused_feature)
             rm = self.reg_head(fused_feature)
-            print(f"[Where2comm] 检测头输出尺寸: psm={psm.shape}, rm={rm.shape}")
 
             output_dict.update({"psm": psm, "rm": rm})
 
             if self.args["obj_head"]:
                 obj = self.obj_head(fused_feature)
-                print(f"[Where2comm] obj_head输出尺寸: obj={obj.shape}")
                 output_dict.update({"obj": obj})
 
             output_dict.update(

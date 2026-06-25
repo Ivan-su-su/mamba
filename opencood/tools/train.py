@@ -665,7 +665,7 @@ def main():
         if main_process:
             print(f"Results will be saved to: {saved_path}")
     assert saved_path is not None
-    
+
     # Training loop
     writer = SummaryWriter(saved_path) if main_process else None
     print("Starting training...")

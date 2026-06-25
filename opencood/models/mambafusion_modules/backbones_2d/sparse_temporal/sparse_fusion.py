@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -19,107 +20,52 @@ def _to_2tuple(value: Union[int, Tuple[int, int]]) -> Tuple[int, int]:
 
 
 class TemporalNeedHead(nn.Module):
-    """Predict temporal need maps directly from fused BEV plus fusion cues."""
+    """Predict temporal need maps from detached gate priors plus a light residual head."""
 
     def __init__(
         self,
         channels: int,
+        feature_channels: int = 16,
+        residual_channels: int = 16,
+        prior_clamp_min: float = 0.01,
+        prior_clamp_max: float = 0.99,
+        smoothing_kernel_size: int = 1,
         cue_distance_channels: int = 3,
         hidden_channels: Optional[int] = None,
-        smoothing_kernel_size: int = 3,
         need_init_bias: float = 0.25,
     ) -> None:
-        """Initialize the temporal need prediction head.
+        """Initialize the foreground-prior temporal need prediction head.
 
         Args:
             channels: BEV feature channel count.
-            cue_distance_channels: Channel count of each source `distance_*` tensor
-                (e.g. stacked ``sum(d_k), sum(s_k), sum(ws_k)`` maps).
-            hidden_channels: Optional hidden width for the prediction head.
-            smoothing_kernel_size: Average smoothing kernel for need maps.
-            need_init_bias: Initial bias for the final need-logit layer.
+            feature_channels: Output channels of the lightweight current-feature encoder.
+            residual_channels: Hidden width of the residual correction head.
+            prior_clamp_min: Lower clamp for the detached gate prior before logit conversion.
+            prior_clamp_max: Upper clamp for the detached gate prior before logit conversion.
+            smoothing_kernel_size: Average smoothing kernel for need maps. Disabled when <= 1.
+            cue_distance_channels: Kept for backward-compatible constructor signatures.
+            hidden_channels: Kept for backward-compatible constructor signatures.
+            need_init_bias: Kept for backward-compatible constructor signatures.
         """
         super().__init__()
-        hidden_dim = hidden_channels if hidden_channels is not None else channels
-        self.cue_distance_channels = int(cue_distance_channels)
+        self.feature_channels = int(feature_channels)
+        self.residual_channels = int(residual_channels)
+        self.prior_clamp_min = float(prior_clamp_min)
+        self.prior_clamp_max = float(prior_clamp_max)
         self.smoothing_kernel_size = int(smoothing_kernel_size)
-        aux_channels = 2 * (self.cue_distance_channels + 1) + 2
-        self.need_head = nn.Sequential(
-            nn.Conv2d(channels + aux_channels, hidden_dim, kernel_size=3, padding=1, bias=False),
-            LayerNorm2d(hidden_dim),
+        self.current_feature_encoder = nn.Sequential(
+            nn.Conv2d(channels, self.feature_channels, kernel_size=3, padding=1, bias=False),
+            LayerNorm2d(self.feature_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
-            LayerNorm2d(hidden_dim),
+        )
+        need_input_channels = self.feature_channels + 3
+        self.residual_head = nn.Sequential(
+            nn.Conv2d(need_input_channels, self.residual_channels, kernel_size=3, padding=1, bias=False),
+            LayerNorm2d(self.residual_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, 1, kernel_size=1, bias=True),
+            nn.Conv2d(self.residual_channels, 1, kernel_size=1, bias=True),
         )
-        nn.init.constant_(self.need_head[-1].bias, float(need_init_bias))
-
-    def _normalize_cue_distance(
-        self,
-        value: Optional[torch.Tensor],
-        batch_size: int,
-        height: int,
-        width: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Pad or trim multi-channel distance/cue maps to a fixed channel width."""
-        expected = self.cue_distance_channels
-        if value is None:
-            return torch.zeros(batch_size, expected, height, width, device=device, dtype=dtype)
-        if value.dim() != 4:
-            raise ValueError(f"distance/cue maps must be [B, C, H, W], got {value.shape}")
-        if value.shape[0] != batch_size or value.shape[2:] != (height, width):
-            raise ValueError(
-                "distance/cue spatial/batch shape must match current feature, "
-                f"got value={value.shape}, feature={[batch_size, height, width]}"
-            )
-        if value.shape[1] == expected:
-            return value.to(device=device, dtype=dtype)
-        if value.shape[1] > expected:
-            return value[:, :expected].to(device=device, dtype=dtype)
-        pad_channels = expected - value.shape[1]
-        pad = torch.zeros(batch_size, pad_channels, height, width, device=device, dtype=dtype)
-        return torch.cat([value.to(device=device, dtype=dtype), pad], dim=1)
-
-    def _normalize_single_map(
-        self,
-        value: Optional[torch.Tensor],
-        batch_size: int,
-        height: int,
-        width: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Normalize one optional aux map into `[B, 1, H, W]`."""
-        if value is None:
-            return torch.zeros(batch_size, 1, height, width, device=device, dtype=dtype)
-        if value.dim() != 4 or value.shape[1] != 1:
-            raise ValueError(f"Expected [B, 1, H, W], got {value.shape}")
-        if value.shape[0] != batch_size or value.shape[2:] != (height, width):
-            raise ValueError(
-                "Aux map spatial/batch shape must match current feature, "
-                f"got aux={value.shape}, feature={[batch_size, height, width]}"
-            )
-        return value.to(device=device, dtype=dtype)
-
-    def _build_source_aux(
-        self,
-        distance: Optional[torch.Tensor],
-        gate: Optional[torch.Tensor],
-        batch_size: int,
-        height: int,
-        width: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Pack one source's aux tensors into a fixed channel block."""
-        normalized_distance = self._normalize_cue_distance(
-            distance, batch_size, height, width, device, dtype
-        )
-        normalized_gate = self._normalize_single_map(gate, batch_size, height, width, device, dtype)
-        return torch.cat([normalized_distance, normalized_gate], dim=1), normalized_gate
+        nn.init.constant_(self.residual_head[-1].bias, 0.0)
 
     def forward(
         self,
@@ -129,14 +75,13 @@ class TemporalNeedHead(nn.Module):
         distance_rsu: Optional[torch.Tensor] = None,
         gate_rsu: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Predict current-frame temporal need directly.
+        """Predict current-frame temporal need from detached gate priors.
 
         Args:
             current_feature: Current fused BEV feature of shape `[B, C, H, W]`.
-            distance_drone: Drone stacked cue maps `[B, C_cue, H, W]` (e.g. sum of
-                ``d_k``, ``s_k``, ``ws_k`` along the point axis).
+            distance_drone: Kept for backward compatibility; not used by this head.
             gate_drone: Drone final fusion gate `[B, 1, H, W]`.
-            distance_rsu: RSU stacked cue maps `[B, C_cue, H, W]`.
+            distance_rsu: Kept for backward compatibility; not used by this head.
             gate_rsu: RSU final fusion gate `[B, 1, H, W]`.
 
         Returns:
@@ -144,36 +89,31 @@ class TemporalNeedHead(nn.Module):
                 - confidence map `[B, 1, H, W]`
                 - temporal need map `[B, 1, H, W]`
         """
-        if current_feature.dim() != 4:
-            raise ValueError(f"current_feature must be [B, C, H, W], got {current_feature.shape}")
         batch_size, _, height, width = current_feature.shape
         device = current_feature.device
         dtype = current_feature.dtype
-        aux_drone, normalized_gate_drone = self._build_source_aux(
-            distance_drone,
-            gate_drone,
-            batch_size,
-            height,
-            width,
-            device,
-            dtype,
-        )
-        aux_rsu, normalized_gate_rsu = self._build_source_aux(
-            distance_rsu,
-            gate_rsu,
-            batch_size,
-            height,
-            width,
-            device,
-            dtype,
-        )
-        gate_max = torch.maximum(normalized_gate_drone, normalized_gate_rsu)
-        gate_weak = 1.0 - gate_max
+        # distance_drone / distance_rsu are kept for backward compatibility,
+        # but are no longer used by the new foreground-prior temporal need head.
+
+        if gate_drone is None:
+            gate_drone = torch.zeros(batch_size, 1, height, width, device=device, dtype=dtype)
+        if gate_rsu is None:
+            gate_rsu = torch.zeros(batch_size, 1, height, width, device=device, dtype=dtype)
+
+        gate_max = torch.maximum(gate_drone, gate_rsu)
+        gate_sum = torch.clamp(gate_drone + gate_rsu, 0.0, 1.0)
+        gate_disagreement = torch.abs(gate_drone - gate_rsu)
+
+        current_desc = self.current_feature_encoder(current_feature)
         need_input = torch.cat(
-            [current_feature, aux_drone, aux_rsu, gate_max, gate_weak],
+            [current_desc, gate_max, gate_sum, gate_disagreement],
             dim=1,
         )
-        need_logits = self.need_head(need_input)
+
+        prior = gate_max.clamp(min=self.prior_clamp_min, max=self.prior_clamp_max)
+        prior_logit = torch.log(prior / (1.0 - prior))
+        residual_logit = self.residual_head(need_input)
+        need_logits = prior_logit + residual_logit
         need_map = torch.sigmoid(need_logits)
 
         if self.smoothing_kernel_size > 1:
@@ -683,8 +623,12 @@ class SparseTemporalFusionBlock(nn.Module):
         window_size: Union[int, Tuple[int, int]] = 4,
         need_topk: Optional[int] = None,
         need_threshold: Optional[float] = 0.5,
-        need_smoothing_kernel_size: int = 3,
+        need_smoothing_kernel_size: int = 1,
         need_init_bias: float = 0.25,
+        need_feature_channels: int = 16,
+        need_residual_channels: int = 16,
+        need_prior_clamp_min: float = 0.01,
+        need_prior_clamp_max: float = 0.99,
         residual_offset_range: float = 2.0,
         base_scale_multiplier: float = 1.0,
         base_scale_min: float = 1.0,
@@ -707,8 +651,12 @@ class SparseTemporalFusionBlock(nn.Module):
             window_size: Need routing window size.
             need_topk: Optional number of routed windows.
             need_threshold: Optional routed-window threshold.
-            need_smoothing_kernel_size: Need smoothing kernel size.
-            need_init_bias: Initial bias for direct need prediction.
+            need_smoothing_kernel_size: Need smoothing kernel size. Disabled when <= 1.
+            need_init_bias: Kept for backward-compatible constructor signatures.
+            need_feature_channels: Output channels of the temporal need feature encoder.
+            need_residual_channels: Hidden width of the temporal need residual head.
+            need_prior_clamp_min: Lower clamp for detached gate prior before logit conversion.
+            need_prior_clamp_max: Upper clamp for detached gate prior before logit conversion.
             residual_offset_range: Learned residual offset range in pixel units.
             base_scale_multiplier: Multiplier applied to motion-derived base expansion.
             base_scale_min: Minimum base expansion in pixel units.
@@ -725,8 +673,12 @@ class SparseTemporalFusionBlock(nn.Module):
         self.return_debug = return_debug
         self.need_head = TemporalNeedHead(
             channels=channels,
-            cue_distance_channels=cue_distance_channels,
+            feature_channels=need_feature_channels,
+            residual_channels=need_residual_channels,
+            prior_clamp_min=need_prior_clamp_min,
+            prior_clamp_max=need_prior_clamp_max,
             smoothing_kernel_size=need_smoothing_kernel_size,
+            cue_distance_channels=cue_distance_channels,
             need_init_bias=need_init_bias,
         )
         self.window_router = WindowRouter(
@@ -756,6 +708,9 @@ class SparseTemporalFusionBlock(nn.Module):
         )
         self.register_buffer('history_feature', torch.empty(0), persistent=False)
         self.register_buffer('history_valid', torch.zeros(1, dtype=torch.bool), persistent=False)
+        self.need_vis_counter = 0
+        self.need_vis_step = 0
+        self.need_vis_epoch = None
 
     def _clear_history(self) -> None:
         """Clear temporal history."""
@@ -775,6 +730,79 @@ class SparseTemporalFusionBlock(nn.Module):
             return False
         return tuple(self.history_feature.shape) == tuple(current_feature.shape)
 
+    def _visualize_need_maps(
+        self,
+        need_map: torch.Tensor,
+        pixel_mask: torch.Tensor,
+        epoch: Optional[Any] = None,
+    ) -> None:
+        """Save need_map and pixel_mask side-by-side during training."""
+        if not self.training:
+            return
+        import matplotlib.pyplot as plt
+
+        save_dir = "./map_need_visualization"
+        os.makedirs(save_dir, exist_ok=True)
+
+        epoch_num = None
+        if epoch is None:
+            epoch_str = "unknown"
+        elif isinstance(epoch, torch.Tensor):
+            epoch_num = int(epoch.detach().cpu().item())
+            epoch_str = str(epoch_num)
+        elif isinstance(epoch, float) and epoch.is_integer():
+            epoch_num = int(epoch)
+            epoch_str = str(epoch_num)
+        elif isinstance(epoch, int):
+            epoch_num = epoch
+            epoch_str = str(epoch)
+        else:
+            epoch_str = str(epoch)
+            try:
+                epoch_num = int(epoch)
+            except (TypeError, ValueError):
+                epoch_num = None
+
+        if epoch_num is not None and self.need_vis_epoch != epoch_num:
+            self.need_vis_epoch = epoch_num
+            self.need_vis_step = 0
+
+        step_num = self.need_vis_step
+        self.need_vis_step += 1
+
+        need_cpu = need_map.detach().float().cpu()
+        mask_cpu = pixel_mask.detach().float().cpu()
+        batch_size = need_cpu.shape[0]
+
+        for b in range(min(batch_size, 2)):
+            nm = need_cpu[b, 0].numpy()
+            pm = mask_cpu[b, 0].numpy()
+
+            nm_mean = float(need_cpu[b, 0].mean().item())
+            nm_min = float(need_cpu[b, 0].min().item())
+            nm_max = float(need_cpu[b, 0].max().item())
+            active_ratio = float(mask_cpu[b, 0].mean().item())
+
+            fig, axes = plt.subplots(1, 2, figsize=(13, 5), constrained_layout=True)
+
+            im0 = axes[0].imshow(nm, vmin=0.0, vmax=1.0, cmap="viridis")
+            fig.colorbar(im0, ax=axes[0], shrink=0.85)
+            axes[0].set_title(
+                f"need_map  mean={nm_mean:.4f}, min={nm_min:.4f}, max={nm_max:.4f}",
+                fontsize=9,
+            )
+
+            im1 = axes[1].imshow(pm, vmin=0.0, vmax=1.0, cmap="viridis")
+            fig.colorbar(im1, ax=axes[1], shrink=0.85)
+            axes[1].set_title(
+                f"pixel_mask  active_ratio={active_ratio:.4f}",
+                fontsize=9,
+            )
+
+            fname = f"need_epoch_{epoch_str}_step_{step_num:06d}_b{b}.png"
+            fig.savefig(os.path.join(save_dir, fname), dpi=150)
+            plt.close(fig)
+
     def forward(
         self,
         current_feature: torch.Tensor,
@@ -785,6 +813,7 @@ class SparseTemporalFusionBlock(nn.Module):
         distance_rsu: Optional[torch.Tensor] = None,
         gate_rsu: Optional[torch.Tensor] = None,
         return_debug: Optional[bool] = None,
+        epoch: Optional[Any] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, Any]]]:
         """Apply sparse temporal refinement to the current fused BEV.
 
@@ -814,6 +843,13 @@ class SparseTemporalFusionBlock(nn.Module):
             gate_rsu=gate_rsu,
         )
         pixel_mask, window_mask, window_scores = self.window_router(need_map)
+        if self.training and self.need_vis_counter % 30 == 0:
+            self._visualize_need_maps(
+                need_map=need_map,
+                pixel_mask=pixel_mask,
+                epoch=epoch,
+            )
+        self.need_vis_counter += 1
 
         if temporal_reset:
             self._clear_history()
