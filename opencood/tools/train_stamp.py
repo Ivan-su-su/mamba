@@ -24,6 +24,18 @@ from opencood.tools import multi_gpu_utils, train_utils
 from tqdm import tqdm
 
 
+def freeze_all_batchnorm(model: torch.nn.Module) -> None:
+    """Keep BatchNorm in eval mode so running stats are not updated.
+
+    ``model.train()`` re-enables BN updates even for modules whose
+    ``requires_grad=False``. With batch_size=1 this quickly pollutes
+    running_mean/var and causes exploding validation loss.
+    """
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            module.eval()
+
+
 def train_parser():
     parser = argparse.ArgumentParser(description="synthetic data generation")
     parser.add_argument(
@@ -42,7 +54,7 @@ def train_parser():
     )
     parser.add_argument("--rank", default=0, type=int)
     parser.add_argument("--tag", default="default")
-    parser.add_argument("--worker", default=16, type=int)
+    parser.add_argument("--worker", default=2, type=int)
     parser.add_argument("--vehicle_dir", default=None, type=str, 
                         help="Model directory of the pretrained vehicle collaborative model.")
     parser.add_argument("--vehicle_epoch", type=int, default=20, 
@@ -140,6 +152,18 @@ def main():
         model_without_ddp = model.module
     # define the loss
     criterion = train_utils.create_loss(hypes)
+    adapter_criterion = None
+    adapter_loss_weight = 0.0
+    if "adapter" in hypes.get("loss", {}):
+        from opencood.loss.adapter_loss import AdapterLoss
+
+        adapter_criterion = AdapterLoss(hypes["loss"]["adapter"]["args"])
+        adapter_loss_weight = float(
+            hypes["loss"]["adapter"].get("weight", 1.0)
+        )
+        print(
+            f"[STAMP] AdapterLoss enabled, weight={adapter_loss_weight}"
+        )
 
     # optimizer setup
     optimizer = train_utils.setup_optimizer(hypes, model)
@@ -166,17 +190,23 @@ def main():
     if opt.drone_dir:
         assert opt.vehicle_dir is not None, "Vehicle model directory should be provided if drone model directory is provided."
         print("Loading pretrained drone model from %s" % opt.drone_dir)
-        _, model = train_utils.load_model(opt.drone_dir, model, opt.drone_epoch)
-        
+        _, model = train_utils.load_model(
+            opt.drone_dir, model, opt.drone_epoch, start_from_best=False
+        )
+
     if opt.rsu_dir:
         assert opt.vehicle_dir is not None, "Vehicle model directory should be provided if rsu model directory is provided."
         print("Loading pretrained rsu model from %s" % opt.rsu_dir)
-        _, model = train_utils.load_model(opt.rsu_dir, model, opt.rsu_epoch)
-        
+        _, model = train_utils.load_model(
+            opt.rsu_dir, model, opt.rsu_epoch, start_from_best=False
+        )
+
     # For the current implementation, vehicle model must be loaded last because ego is vehicular by default.
     if opt.vehicle_dir:
         print("Loading pretrained vehicle model from %s" % opt.vehicle_dir)
-        _, model = train_utils.load_model(opt.vehicle_dir, model, opt.vehicle_epoch)
+        _, model = train_utils.load_model(
+            opt.vehicle_dir, model, opt.vehicle_epoch, start_from_best=False
+        )
 
     # record lowest validation loss checkpoint.
     lowest_val_loss = 1e5
@@ -204,6 +234,9 @@ def main():
                 continue
             # the model will be evaluation mode during validation
             model.train()
+            # Re-freeze BN after train(); otherwise frozen encoders still
+            # update running stats and poison eval.
+            freeze_all_batchnorm(model)
             model.zero_grad()
             optimizer.zero_grad()
 
@@ -228,6 +261,13 @@ def main():
                 # first argument is always your output dictionary,
                 # second argument is always your label dictionary.
                 final_loss = criterion(output_dict, batch_data["ego"]["label_dict"])
+                if (
+                    adapter_criterion is not None
+                    and adapter_loss_weight > 0
+                    and "adapter_align" in output_dict
+                ):
+                    adapter_loss = adapter_criterion(output_dict["adapter_align"])
+                    final_loss = final_loss + adapter_loss_weight * adapter_loss
             if False:
                 # if len(output_dict) > 2:
                 single_loss_v = criterion(
@@ -255,6 +295,12 @@ def main():
 
             # criterion.logging(epoch, i, len(train_loader), writer)
             print_msg = criterion.logging(epoch, i, len(train_loader), writer)
+            if (
+                adapter_criterion is not None
+                and adapter_criterion.loss_dict
+                and opt.rank == 0
+            ):
+                adapter_criterion.logging(epoch, i, len(train_loader), writer)
             pbar.set_description(print_msg)
 
             if False:
@@ -272,6 +318,7 @@ def main():
             # print(a)
             # back-propagation
             final_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             optimizer.step()
             # torch.cuda.empty_cache()
         if opt.rank == 0:
@@ -313,6 +360,17 @@ def main():
                             final_loss = criterion(
                                 ouput_dict, batch_data["ego"]["label_dict"]
                             )
+                            if (
+                                adapter_criterion is not None
+                                and adapter_loss_weight > 0
+                                and "adapter_align" in ouput_dict
+                            ):
+                                adapter_loss = adapter_criterion(
+                                    ouput_dict["adapter_align"]
+                                )
+                                final_loss = (
+                                    final_loss + adapter_loss_weight * adapter_loss
+                                )
 
                         pbar_val.set_description(
                             "Validation Loss: {}".format(final_loss.item())

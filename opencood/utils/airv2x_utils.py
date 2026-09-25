@@ -315,6 +315,47 @@ def get_ex_intrinsic(metainfo) -> Tuple[np.ndarray, np.ndarray]:
     return np.array(intrinsics), np.array(extrinsics)
 
 
+CAMERA_KEYS_BY_AGENT: Dict[str, List[str]] = {
+    "vehicle": [
+        "front_camera",
+        "front_left_camera",
+        "front_right_camera",
+        "rear_camera",
+        "rear_left_camera",
+        "rear_right_camera",
+    ],
+    "rsu": [
+        "back_camera",
+        "front_camera",
+        "left_camera",
+        "right_camera",
+    ],
+    "drone": ["bev_camera"],
+}
+
+
+def compute_camera_world_z(params: Dict[str, Any], agent_type: str) -> np.ndarray:
+    """World-z of each camera from this CAV's odometry plus camera.cords.
+
+    Same camera key order as ``get_ex_intrinsic``. No depth/box GT.
+
+    Args:
+        params: CAV metadata with ``odometry.ego_pos`` and per-camera ``cords``.
+        agent_type: ``vehicle``, ``rsu``, or ``drone``.
+
+    Returns:
+        Float32 array of shape ``[Ncam]``.
+    """
+    if agent_type not in CAMERA_KEYS_BY_AGENT:
+        raise ValueError(f"Unknown agent type: {agent_type}")
+    ego_pos = params["odometry"]["ego_pos"]
+    zs: List[float] = []
+    for cam_key in CAMERA_KEYS_BY_AGENT[agent_type]:
+        world_pose = get_abs_world_pose(params[cam_key]["cords"], ego_pos)
+        zs.append(float(world_pose[2]))
+    return np.asarray(zs, dtype=np.float32)
+
+
 def project_lidar_to_cam_single(
     lidar_np, cam_intrinsic, imgH, imgW, cam_pos, lidar_pos, vis_image
 ):

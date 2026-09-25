@@ -146,6 +146,11 @@ class Airv2xCoBEVT(Airv2xBase):
         if self.compression:
             spatial_features_2d = self.naive_compressor(spatial_features_2d)
 
+        # Corrupt collaborator BEV immediately before fusion (fair vs MambaFusion).
+        spatial_features_2d = self.maybe_corrupt_pre_fusion(
+            spatial_features_2d, data_dict
+        )
+
         # N, C, H, W -> B,  L, C, H, W
         # TODO(YH): bug here
         regroup_feature, mask = regroup(
@@ -171,6 +176,9 @@ class Airv2xCoBEVT(Airv2xBase):
             if self.args["obj_head"]:
                 obj = self.obj_head(fused_feature)
                 output_dict.update({"obj": obj})
+            for k, v in batch_dict_output.items():
+                if k.startswith("depth_items"):
+                    output_dict[k] = v
         elif self.args["task"] == "seg":
             # seg_logits = self.seg_head(fused_feature)
             # output_dict = {"seg_logits": seg_logits}

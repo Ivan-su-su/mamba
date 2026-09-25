@@ -744,6 +744,8 @@ class LSSTransform_Lite(nn.Module):
                     x_down = self.sub_dim(x_down)
                     # 更新x_down，但保持x不变（x是原始图像特征）
                     x_down = self.mamba_layernorm((x + x_down).permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
+
+                    return x_down
                 else:
                     # 如果没有pillar_features，跳过Mamba处理
                     pass

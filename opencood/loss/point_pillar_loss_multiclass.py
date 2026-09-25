@@ -134,6 +134,19 @@ class PointPillarLossMultiClass(nn.Module):
             self.need_bridge_iterations = int(need_aux_cfg.get("BRIDGE_ITERATIONS", 1))
         self.need_debug_step = 0
 
+        self.depth = args.get("depth")
+        if self.depth:
+            from opencood.loss.point_pillar_depth_loss import FocalLoss
+            self.depth_weight = self.depth["weight"]
+            self.smooth_target = True if "smooth_target" in self.depth and self.depth["smooth_target"] else False
+            self.use_fg_mask = True if "use_fg_mask" in self.depth and self.depth["use_fg_mask"] else False
+            self.fg_weight = 3.25
+            self.bg_weight = 0.25
+            if self.smooth_target:
+                self.depth_loss_func = FocalLoss(alpha=0.25, gamma=2.0, reduction="none", smooth_target=True)
+            else:
+                self.depth_loss_func = FocalLoss(alpha=0.25, gamma=2.0, reduction="none")
+
 
     def _gaussian_blur_mask(self, mask, kernel_size, sigma) -> torch.Tensor:
         """Apply depthwise Gaussian smoothing to a `[B, 1, H, W]` mask."""
@@ -931,6 +944,25 @@ class PointPillarLossMultiClass(nn.Module):
             else:
                 loss_dict_update["iou_loss{}".format(prefix)] = float(iou_loss_weighted)
         self.loss_dict.update(loss_dict_update)
+
+        if getattr(self, "depth", None):
+            all_depth_loss = 0
+            depth_items_list = [x for x in output_dict.keys() if x.startswith("depth_items{}".format(prefix))]
+            for depth_item_name in depth_items_list:
+                depth_item = output_dict[depth_item_name]
+                depth_logit, depth_gt_indices = depth_item[0], depth_item[1]
+                depth_loss = self.depth_loss_func(depth_logit, depth_gt_indices)
+                if self.use_fg_mask:
+                    fg_mask = depth_item[-1]
+                    weight_mask = (fg_mask > 0) * self.fg_weight + (fg_mask == 0) * self.bg_weight
+                    depth_loss *= weight_mask
+                depth_loss = depth_loss.mean() * self.depth_weight
+                all_depth_loss += depth_loss
+            total_loss = total_loss + all_depth_loss
+            self.loss_dict["depth_loss"] = (
+                all_depth_loss.item() if torch.is_tensor(all_depth_loss) else all_depth_loss
+            )
+            self.loss_dict["total_loss{}".format(prefix)] = total_loss.item()
 
         return total_loss
 

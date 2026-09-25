@@ -108,6 +108,39 @@ def inference_early_fusion(batch_data, model, dataset):
     
     output_dict["ego"] = model_output
 
+    # Stash selective-transmission maps for optional inference visualization.
+    # Does not change return signature / original post-process path.
+    if isinstance(model_output, dict):
+        if "fusion_gate_outputs" in model_output:
+            batch_data["ego"]["_saved_fusion_gate_outputs"] = model_output[
+                "fusion_gate_outputs"
+            ]
+        if "transmission_maps" in model_output:
+            batch_data["ego"]["_saved_transmission_maps"] = model_output[
+                "transmission_maps"
+            ]
+        if "bev_corrupt_maps" in model_output:
+            batch_data["ego"]["_saved_bev_corrupt_maps"] = model_output[
+                "bev_corrupt_maps"
+            ]
+        # Where2comm / Mamba may stash corrupt maps on input ego dict during forward
+        if "_bev_corrupt_maps" in batch_data["ego"]:
+            batch_data["ego"]["_saved_bev_corrupt_maps"] = batch_data["ego"][
+                "_bev_corrupt_maps"
+            ]
+        if "fusion_aux_outputs" in model_output:
+            batch_data["ego"]["_saved_fusion_aux_outputs"] = model_output[
+                "fusion_aux_outputs"
+            ]
+        if "pre_temporal_feature" in model_output:
+            batch_data["ego"]["_saved_pre_temporal_feature"] = model_output[
+                "pre_temporal_feature"
+            ]
+        if "corrupted_drone_bev" in model_output:
+            batch_data["ego"]["_saved_corrupted_drone_bev"] = model_output[
+                "corrupted_drone_bev"
+            ]
+
     # 检查模型是否直接返回了预测结果（Airv2xMambafusion的情况）
     if isinstance(model_output, dict) and 'pred_box_tensor' in model_output:
         pred_box_tensor = model_output['pred_box_tensor']

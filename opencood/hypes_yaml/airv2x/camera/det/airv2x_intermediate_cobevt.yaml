@@ -32,9 +32,9 @@ train: &train True
 # Dataset #
 ###########
 
-root_dir: 'dataset/airv2x/train'
-validate_dir: 'dataset/airv2x/val'
-test_dir: 'dataset/airv2x/test'
+root_dir: '/home/dell/suyi/AirV2X-Perception/train/train'
+validate_dir: '/home/dell/suyi/AirV2X-Perception/val/val'
+test_dir: '/home/dell/suyi/AirV2X-Perception/test/test'
 num_class: &num_class 7
 num_anchor: &num_anchor 2
 
@@ -53,7 +53,7 @@ fusion:
       xbound: [-140.8, 140.8, 0.4]    
       ybound: [-40, 40, 0.4]  
       zbound: [-10, 10, 20.0] 
-      ddiscr: [2, 50, 48]
+      ddiscr: [0, 50, 50]
       mode: 'LID'
     veh_data_aug_conf: &veh_data_aug_conf_image
       resize_lim: [0.65, 0.7]
@@ -183,8 +183,8 @@ model:
         img_features: 64
         bevout_feature: 64
         camera_encoder: EfficientNet
-        use_depth_gt: true
-        depth_supervision: false
+        use_depth_gt: false
+        depth_supervision: true
     
     ###################
     # Road Side Units #
@@ -213,8 +213,8 @@ model:
         img_features: 64
         bevout_feature: 64
         camera_encoder: EfficientNet
-        use_depth_gt: true
-        depth_supervision: false
+        use_depth_gt: false
+        depth_supervision: true
 
     ######################
     # UAV (Drone) Agents #
@@ -243,8 +243,8 @@ model:
         img_features: 64
         bevout_feature: 64
         camera_encoder: EfficientNet
-        use_depth_gt: true
-        depth_supervision: false
+        use_depth_gt: false
+        depth_supervision: true
 
     base_bev_backbone:
       layer_nums: [3, 5, 8]
@@ -297,6 +297,8 @@ loss:
       cls_weight: 1.0
       reg: 2.0
       num_class: *num_class
+      depth:
+        weight: 1.0
   seg:
     core_method: vanilla_seg_loss
     args:

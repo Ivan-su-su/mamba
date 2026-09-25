@@ -1,0 +1,18 @@
+python opencood/tools/train_stamp.py \
+  -y opencood/hypes_yaml/airv2x/camera_lidar/det/airv2x_heal/single/airv2x_HEAL_vehicle_cam_lidar.yaml \
+  --worker 2
+
+python opencood/tools/train_stamp.py \
+  -y opencood/hypes_yaml/airv2x/camera_lidar/det/airv2x_heal/single/airv2x_HEAL_rsu_cam_lidar.yaml \
+  --worker 2
+
+python opencood/tools/train_stamp.py \
+  -y opencood/hypes_yaml/airv2x/camera_lidar/det/airv2x_heal/single/airv2x_HEAL_drone_cam_lidar.yaml \
+  --worker 2
+
+python opencood/tools/train_stamp.py \
+  -y opencood/hypes_yaml/airv2x/camera_lidar/det/airv2x_heal/airv2x_HEAL_collab_cam_lidar.yaml \
+  --worker 2 \
+  --vehicle_dir <vehicle_log> --vehicle_epoch <N> \
+  --rsu_dir <rsu_log> --rsu_epoch <N> \
+  --drone_dir <drone_log> --drone_epoch <N>

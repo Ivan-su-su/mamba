@@ -1,0 +1,95 @@
+# ========== BEV Corruption Ablation: UAV + mask_gaussian medium ==========
+# Order: spatial mask (ratio) then Gaussian noise (sigma) on remaining BEV.
+# Injection: corrupt collaborator BEV immediately BEFORE fusion.
+# Smoke: add --max_batches 2
+# Expect: [BEV Corruption] scenario=uav type=mask_gaussian level=medium agents=['drone']
+# Result file: results_corrupt_uav_mask_gaussian_medium.txt
+#
+# cd /home/dell/suyi/AirV2X-Perception_copy
+
+# --- UAV mask+gauss: V2X-ViT (epoch 14) ---
+python opencood/tools/inference_multi_scenario.py \
+  --model_dir /home/dell/suyi/AirV2X-Perception_copy/opencood/logs/airv2x_intermediate_v2xvit \
+  --eval_epoch 14 \
+  --corrupt_scenario uav --corrupt_type mask_gaussian --corrupt_level medium
+
+# --- UAV mask+gauss: Where2comm (epoch 12) ---
+python opencood/tools/inference_multi_scenario.py \
+  --model_dir /home/dell/suyi/AirV2X-Perception_copy/opencood/logs/airv2x_intermediate_where2comm/default_2026_06_24_15_39_27 \
+  --eval_epoch 12 \
+  --corrupt_scenario uav --corrupt_type mask_gaussian --corrupt_level medium
+
+# --- UAV mask+gauss: CoBEVT (epoch 8) ---
+python opencood/tools/inference_multi_scenario.py \
+  --model_dir /home/dell/suyi/AirV2X-Perception_copy/opencood/logs/airv2x_intermediate_cobevt \
+  --eval_epoch 8 \
+  --corrupt_scenario uav --corrupt_type mask_gaussian --corrupt_level medium
+
+# --- UAV mask+gauss: MambaFusion (epoch 16) ---
+python opencood/tools/inference_multi_scenario.py \
+  --model_dir /home/dell/suyi/AirV2X-Perception_copy/opencood/logs/airv2x_intermediate_mambafusion/default_all_set \
+  --eval_epoch 16 \
+  --corrupt_scenario uav --corrupt_type mask_gaussian --corrupt_level medium
+
+# ========== BEV Corruption Ablation: RSU + mask_gaussian medium ==========
+# Expect: [BEV Corruption] scenario=rsu type=mask_gaussian level=medium agents=['rsu']
+# Result file: results_corrupt_rsu_mask_gaussian_medium.txt
+
+# --- RSU mask+gauss: V2X-ViT (epoch 14) ---
+python opencood/tools/inference_multi_scenario.py \
+  --model_dir /home/dell/suyi/AirV2X-Perception_copy/opencood/logs/airv2x_intermediate_v2xvit \
+  --eval_epoch 14 \
+  --corrupt_scenario rsu --corrupt_type mask_gaussian --corrupt_level medium
+
+# --- RSU mask+gauss: Where2comm (epoch 12) ---
+python opencood/tools/inference_multi_scenario.py \
+  --model_dir /home/dell/suyi/AirV2X-Perception_copy/opencood/logs/airv2x_intermediate_where2comm/default_2026_06_24_15_39_27 \
+  --eval_epoch 12 \
+  --corrupt_scenario rsu --corrupt_type mask_gaussian --corrupt_level medium
+
+# --- RSU mask+gauss: CoBEVT (epoch 8) ---
+python opencood/tools/inference_multi_scenario.py \
+  --model_dir /home/dell/suyi/AirV2X-Perception_copy/opencood/logs/airv2x_intermediate_cobevt \
+  --eval_epoch 8 \
+  --corrupt_scenario rsu --corrupt_type mask_gaussian --corrupt_level medium
+
+# ========== Agent ablation: w/o drone (drop from available_agents / packing) ==========
+# Mamba: drone removed from available_agents -> feature_drone=None (gate placeholder=0)
+# Where2comm: drone skipped in extract_features packing (not zero-filled)
+# --corrupt_level ignored for type=zero but still required by CLI.
+# Result file: results_corrupt_uav_zero_medium.txt
+# Compare ΔAP = AP_clean - AP_w/o_drone
+
+# --- w/o drone: Where2comm (epoch 12) ---
+python opencood/tools/inference_multi_scenario.py \
+  --model_dir /home/dell/suyi/AirV2X-Perception_copy/opencood/logs/airv2x_intermediate_where2comm/default_2026_06_24_15_39_27 \
+  --eval_epoch 12 \
+  --corrupt_scenario uav --corrupt_type zero --corrupt_level medium
+
+# --- w/o drone: MambaFusion (epoch 16) ---
+python opencood/tools/inference_multi_scenario.py \
+  --model_dir /home/dell/suyi/AirV2X-Perception_copy/opencood/logs/airv2x_intermediate_mambafusion/default_all_set \
+  --eval_epoch 16 \
+  --corrupt_scenario uav --corrupt_type zero --corrupt_level medium
+
+# ========== HEAL drone single: vehicle-ego (recommended) ==========
+# Problem: drone-ego GT z spans ~[-109,-62]; single-height anchors + PointPillar
+# cannot learn; cam+lidar no_double_warp val stuck ~17, AP@0.3~0.02.
+#
+# Fix: train drone single with ego_type=vehicle (collab-aligned), max_cav.vehicle=0
+# (vehicle only provides pose), project drone cam/lidar into vehicle ego.
+# Also set drone lidar_range / cam BEV zbound to vehicle ground range; keep
+# aerial ddiscr for camera depth.
+#
+# YAMLs:
+#   camera_lidar/.../airv2x_HEAL_drone_cam_lidar.yaml
+#   lidar/det/.../airv2x_HEAL_drone_lidar.yaml
+#
+# Smoke: GT z in label should be ~-1 (not ~-89). Fresh train, no resume.
+#
+#   python opencood/tools/train_stamp.py \
+#     -y opencood/hypes_yaml/airv2x/camera_lidar/det/airv2x_heal/single/airv2x_HEAL_drone_cam_lidar.yaml \
+#     --worker 2 --tag vehicle_ego
+#
+# ========== HEAL drone single: anchor z fix (superseded) ==========
+# Older attempts: cz mid-range -78 / GT-mean -89 under ego_type=drone. Insufficient.

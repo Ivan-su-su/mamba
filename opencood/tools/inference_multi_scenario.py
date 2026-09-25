@@ -39,6 +39,12 @@ from opencood.tools.temporal_utils import (
     update_temporal_state,
 )
 from opencood.visualization import simple_vis
+from opencood.utils.bev_corruption import build_corrupt_config, extract_sample_id
+from opencood.utils.gate_statistics import (
+    DEFAULT_SAVE_EVERY,
+    save_gate_statistics,
+    save_transmission_statistics,
+)
 
 # Constants
 SUPPORTED_FUSION_METHODS = [
@@ -127,6 +133,48 @@ def parse_arguments() -> argparse.Namespace:
         type=int,
         default=None,
         help="Stop after N batches (smoke test; default: run full dataloader)",
+    )
+    # BEV feature corruption ablation (default: disabled, original behavior)
+    parser.add_argument(
+        "--corrupt_scenario",
+        type=str,
+        default="clean",
+        choices=["clean", "rsu", "uav", "rsu_uav"],
+        help="Which collaborator BEV features to corrupt at inference",
+    )
+    parser.add_argument(
+        "--corrupt_type",
+        type=str,
+        default="none",
+        choices=[
+            "none",
+            "gaussian",
+            "mask",
+            "mask_gaussian",
+            "gaussian_mask",
+            "mask+gauss",
+            "mask+gaussian",
+            "zero",
+            "drop",
+            "ablate",
+        ],
+        help=(
+            "Corruption type; mask_gaussian = mask then Gaussian; "
+            "zero/drop = fully zero collaborator BEV (agent ablation)"
+        ),
+    )
+    parser.add_argument(
+        "--corrupt_level",
+        type=str,
+        default="medium",
+        choices=["light", "medium", "heavy"],
+        help="Corruption intensity",
+    )
+    parser.add_argument(
+        "--corrupt_seed_base",
+        type=int,
+        default=0,
+        help="Extra seed offset shared across models for fair comparison",
     )
     return parser.parse_args()
 
@@ -296,7 +344,26 @@ def save_visualization(
 def main():
     """Main inference function."""
     opt = parse_arguments()
-    
+    corrupt_cfg = build_corrupt_config(
+        scenario=opt.corrupt_scenario,
+        corrupt_type=opt.corrupt_type,
+        level=opt.corrupt_level,
+        seed_base=opt.corrupt_seed_base,
+    )
+    if corrupt_cfg.enabled:
+        print(
+            f"[BEV Corruption] scenario={corrupt_cfg.scenario} "
+            f"type={corrupt_cfg.corrupt_type} level={corrupt_cfg.level} "
+            f"agents={list(corrupt_cfg.agents)} seed_base={corrupt_cfg.seed_base}"
+        )
+        if opt.result_file == "results.txt":
+            opt.result_file = (
+                f"results_corrupt_{corrupt_cfg.scenario}_"
+                f"{corrupt_cfg.corrupt_type}_{corrupt_cfg.level}.txt"
+            )
+    else:
+        print("[BEV Corruption] disabled (clean / none)")
+
     # Load config and setup
     hypes = yaml_utils.load_yaml(None, opt)
     temporal_cfg = get_temporal_training_cfg(hypes)
@@ -387,6 +454,12 @@ def main():
         with torch.no_grad():
             start_time = time.time()
             batch_data = train_utils.to_device(batch_data, device)
+            # Inject after to_device: CorruptConfig is not a tensor and must not
+            # go through to_device (would become None).
+            if corrupt_cfg.enabled:
+                sample_id = extract_sample_id(batch_data)
+                batch_data["ego"]["bev_corrupt_cfg"] = corrupt_cfg
+                batch_data["ego"]["bev_corrupt_sample_id"] = sample_id
             if use_temporal_streaming:
                 populate_temporal_fields(
                     batch_data["ego"],
@@ -449,6 +522,39 @@ def main():
                     i,
                     left_hand
                 )
+
+            # Selective-transmission diagnostics every N samples (MambaFusion / Where2comm).
+            if (i % DEFAULT_SAVE_EVERY) == 0:
+                sample_id = batch_data["ego"].get(
+                    "bev_corrupt_sample_id",
+                    extract_sample_id(batch_data),
+                )
+                corrupt_maps = batch_data["ego"].get("_saved_bev_corrupt_maps", None)
+                gate_outputs = batch_data["ego"].get(
+                    "_saved_fusion_gate_outputs", None
+                )
+                tx_maps = batch_data["ego"].get("_saved_transmission_maps", None)
+                if gate_outputs is not None:
+                    save_gate_statistics(
+                        gate_outputs=gate_outputs,
+                        save_root=opt.model_dir,
+                        idx=i,
+                        sample_id=str(sample_id),
+                        corrupt_cfg=corrupt_cfg,
+                        corrupt_maps=corrupt_maps,
+                        every=DEFAULT_SAVE_EVERY,
+                    )
+                if tx_maps is not None:
+                    save_transmission_statistics(
+                        transmission_maps=tx_maps,
+                        save_root=opt.model_dir,
+                        idx=i,
+                        sample_id=str(sample_id),
+                        corrupt_cfg=corrupt_cfg,
+                        corrupt_maps=corrupt_maps,
+                        model_tag="where2comm",
+                        every=DEFAULT_SAVE_EVERY,
+                    )
         end_time = time.time()
         print(f"one_epoch Time taken: {end_time - start_time} seconds")
         print("-------------finish_one_epoch-------------------")
@@ -478,6 +584,11 @@ def main():
         
         if opt.comm_thre is not None:
             msg += f" | comm_thre: {opt.comm_thre:.4f}"
+        if corrupt_cfg.enabled:
+            msg += (
+                f" | corrupt: {corrupt_cfg.scenario}/"
+                f"{corrupt_cfg.corrupt_type}/{corrupt_cfg.level}"
+            )
         msg += "\n"
         
         with open(result_path, "a+") as f:

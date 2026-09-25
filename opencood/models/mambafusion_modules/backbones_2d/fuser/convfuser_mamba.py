@@ -1,5 +1,3 @@
-import random
-
 import torch
 from torch import nn
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -15,7 +13,10 @@ import torch.nn.functional as F
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from ..sparse_temporal import SparseTemporalFusionBlock
+from ..sparse_temporal import SparseTemporalFusionBlock, TemporalFusionConcatBlock
+from opencood.utils.bev_corruption import corrupt_bev, filter_agents_for_drop
+
+
 class ConvFuser(nn.Module):
     """
     【AirV2X多agent ConvFuser模块】
@@ -116,7 +117,7 @@ class ConvFuser(nn.Module):
                 final_gate_hidden_dim=fusion_cfg.get('FINAL_GATE_HIDDEN_DIM', 32),
                 gate_head_cfg=fusion_cfg.get('GATE_HEAD', {}),
                 sparse_temporal_cfg=sparse_temporal_cfg,
-                gate_topk_cfg=fusion_cfg.get('GATE_TOPK', {}),
+                gate_alpha_cfg=fusion_cfg.get('GATE_ALPHA', {}),
             )
         if self.use_merge_after:
             depths = [1]
@@ -491,6 +492,10 @@ class ConvFuser(nn.Module):
         img_bev_dict = {}
         lidar_bev_dict = {}
         cat_bev_dict = {}
+
+        # Defense in depth: also drop here so hierarchical fusion gets None.
+        corrupt_cfg = batch_dict.get("bev_corrupt_cfg", None)
+        available_agents = filter_agents_for_drop(available_agents, corrupt_cfg)
         
         for agent in available_agents:
             #img_bev = self.batch_compressor(batch_dict[agent]['spatial_features_img'])  # [B, 80, H, W] - 图像BEV特征  should ignore
@@ -520,10 +525,33 @@ class ConvFuser(nn.Module):
             
             # 【最终卷积】将融合后的特征映射到目标通道数
             mm_bev = self.conv(cat_bev) # [B, 128, H, W]
+            # Optional inference-time BEV corruption (no-op if cfg absent/disabled).
+            # Skip for type=zero: agent already removed from available_agents.
+            if (
+                corrupt_cfg is not None
+                and getattr(corrupt_cfg, "enabled", False)
+                and corrupt_cfg.corrupt_type != "zero"
+            ):
+                sample_id = batch_dict.get("bev_corrupt_sample_id", "unknown_sample")
+                maps_out = batch_dict.setdefault("_bev_corrupt_maps", {})
+                mm_bev = corrupt_bev(
+                    mm_bev,
+                    corrupt_cfg,
+                    sample_id,
+                    agent,
+                    maps_out=maps_out,
+                    map_key=agent,
+                )
             agent_spatial_features[agent] = mm_bev
             
             # 存储融合后的特征用于可视化
             cat_bev_dict[agent] = cat_bev
+
+        # Detached export for paper visualization only (no compute graph change).
+        if bool(batch_dict.get("visualization_debug", False)):
+            drone_bev = agent_spatial_features.get("drone")
+            if drone_bev is not None:
+                batch_dict["corrupted_drone_bev"] = drone_bev.detach()
             
         # 多agent融合
         if self.use_offset_guided_hierarchical_fusion and 'vehicle' in agent_spatial_features:
@@ -1879,7 +1907,7 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
         final_gate_hidden_dim: int = 32,
         gate_head_cfg: Optional[Dict[str, Any]] = None,
         sparse_temporal_cfg: Optional[Dict[str, Any]] = None,
-        gate_topk_cfg: Optional[Dict[str, Any]] = None,
+        gate_alpha_cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Initialize the selective hierarchical fusion block.
 
@@ -1908,7 +1936,7 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
             sample_da_layer_scale_init: DA attention layer scale init.
             final_gate_hidden_dim: Hidden channel count of the final gate head.
             sparse_temporal_cfg: Optional sparse temporal refinement config.
-            gate_topk_cfg: Optional gate topk config.
+            gate_alpha_cfg: Optional gate alpha config.
         """
         super().__init__()
         self.num_points = num_points
@@ -1917,6 +1945,9 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
         self.semantic_channels = 4
         sparse_temporal_cfg = sparse_temporal_cfg or {}
         self.use_sparse_temporal = sparse_temporal_cfg.get('ENABLE', False)
+        self.temporal_fusion_type = str(
+            sparse_temporal_cfg.get('TYPE', 'sparse')
+        ).lower()
         self.temporal_cue_distance_channels = int(
             sparse_temporal_cfg.get('CUE_DISTANCE_CHANNELS', 3)
         )
@@ -2014,78 +2045,82 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
                 raise ValueError(
                     "SPARSE_TEMPORAL.ENABLE=True requires SPARSE_TEMPORAL.POINT_CLOUD_RANGE"
                 )
-            self.sparse_temporal_fusion = SparseTemporalFusionBlock(
-                channels=channels,
-                num_points=sparse_temporal_cfg.get('K_SAMPLES', num_points),
-                cue_distance_channels=self.temporal_cue_distance_channels,
-                point_cloud_range=tuple(point_cloud_range),
-                window_size=sparse_temporal_cfg.get('ROUTE_WINDOW', window_size),
-                need_topk=sparse_temporal_cfg.get('TOPK'),
-                need_threshold=sparse_temporal_cfg.get('NEED_THRESHOLD', 0.5),
-                need_smoothing_kernel_size=sparse_temporal_cfg.get(
-                    'NEED_SMOOTHING_KERNEL_SIZE',
-                    sparse_temporal_cfg.get('SMOOTHING_KERNEL_SIZE', 1),
-                ),
-                need_init_bias=sparse_temporal_cfg.get('NEED_INIT_BIAS', 0.25),
-                need_feature_channels=sparse_temporal_cfg.get('NEED_FEATURE_CHANNELS', 16),
-                need_residual_channels=sparse_temporal_cfg.get('NEED_RESIDUAL_CHANNELS', 16),
-                need_prior_clamp_min=sparse_temporal_cfg.get('NEED_PRIOR_CLAMP_MIN', 0.01),
-                need_prior_clamp_max=sparse_temporal_cfg.get('NEED_PRIOR_CLAMP_MAX', 0.99),
-                residual_offset_range=sparse_temporal_cfg.get('RESIDUAL_OFFSET_RANGE', offset_range),
-                base_scale_multiplier=sparse_temporal_cfg.get('BASE_SCALE_MULTIPLIER', 1.0),
-                base_scale_min=sparse_temporal_cfg.get('BASE_SCALE_MIN', 1.0),
-                base_scale_max=sparse_temporal_cfg.get('BASE_SCALE_MAX', 8.0),
-                base_motion_epsilon=sparse_temporal_cfg.get('BASE_MOTION_EPSILON', 0.5),
-                base_fixed_expansion_no_motion=sparse_temporal_cfg.get(
-                    'BASE_FIXED_EXPANSION_NO_MOTION', 1.0
-                ),
-                include_diagonal_base_offsets=sparse_temporal_cfg.get('INCLUDE_DIAGONAL_BASE_OFFSETS', False),
-                align_corners=align_corners,
-                padding_mode=padding_mode,
-                return_debug=False,
-            )
+            if self.temporal_fusion_type == 'sparse':
+                self.sparse_temporal_fusion = SparseTemporalFusionBlock(
+                    channels=channels,
+                    num_points=sparse_temporal_cfg.get('K_SAMPLES', num_points),
+                    cue_distance_channels=self.temporal_cue_distance_channels,
+                    point_cloud_range=tuple(point_cloud_range),
+                    window_size=sparse_temporal_cfg.get('ROUTE_WINDOW', window_size),
+                    need_topk=sparse_temporal_cfg.get('TOPK'),
+                    need_threshold=sparse_temporal_cfg.get('NEED_THRESHOLD', 0.5),
+                    need_smoothing_kernel_size=sparse_temporal_cfg.get(
+                        'NEED_SMOOTHING_KERNEL_SIZE',
+                        sparse_temporal_cfg.get('SMOOTHING_KERNEL_SIZE', 1),
+                    ),
+                    need_init_bias=sparse_temporal_cfg.get('NEED_INIT_BIAS', 0.25),
+                    need_feature_channels=sparse_temporal_cfg.get('NEED_FEATURE_CHANNELS', 16),
+                    need_residual_channels=sparse_temporal_cfg.get('NEED_RESIDUAL_CHANNELS', 16),
+                    need_prior_clamp_min=sparse_temporal_cfg.get('NEED_PRIOR_CLAMP_MIN', 0.01),
+                    need_prior_clamp_max=sparse_temporal_cfg.get('NEED_PRIOR_CLAMP_MAX', 0.99),
+                    residual_offset_range=sparse_temporal_cfg.get('RESIDUAL_OFFSET_RANGE', offset_range),
+                    base_scale_multiplier=sparse_temporal_cfg.get('BASE_SCALE_MULTIPLIER', 1.0),
+                    base_scale_min=sparse_temporal_cfg.get('BASE_SCALE_MIN', 1.0),
+                    base_scale_max=sparse_temporal_cfg.get('BASE_SCALE_MAX', 8.0),
+                    base_motion_epsilon=sparse_temporal_cfg.get('BASE_MOTION_EPSILON', 0.5),
+                    base_fixed_expansion_no_motion=sparse_temporal_cfg.get(
+                        'BASE_FIXED_EXPANSION_NO_MOTION', 1.0
+                    ),
+                    include_diagonal_base_offsets=sparse_temporal_cfg.get('INCLUDE_DIAGONAL_BASE_OFFSETS', False),
+                    align_corners=align_corners,
+                    padding_mode=padding_mode,
+                    return_debug=False,
+                )
+            elif self.temporal_fusion_type == 'concat':
+                self.sparse_temporal_fusion = TemporalFusionConcatBlock(
+                    channels=channels,
+                    point_cloud_range=tuple(point_cloud_range),
+                    hidden_channels=sparse_temporal_cfg.get('CONCAT_HIDDEN_CHANNELS'),
+                    align_corners=align_corners,
+                    padding_mode=padding_mode,
+                    return_debug=False,
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported SPARSE_TEMPORAL.TYPE={self.temporal_fusion_type}. "
+                    "Expected 'sparse' or 'concat'."
+                )
         else:
             self.sparse_temporal_fusion = None
-        gate_topk_cfg = gate_topk_cfg or {}
-        self.gate_topk_enabled = bool(gate_topk_cfg.get("TOPK_ENABLED", True))
-        self.gate_inference_threshold = float(
-            gate_topk_cfg.get("INFERENCE_THRESHOLD", 0.7)
-        )
+        gate_alpha_cfg = gate_alpha_cfg or {}
+        self.gate_alpha_enabled = bool(gate_alpha_cfg.get("ENABLED", False))
+        self.gate_alpha_warmup_epochs = int(gate_alpha_cfg.get("WARMUP_EPOCHS", 3))
+        self.gate_alpha_list = gate_alpha_cfg.get("ALPHA_LIST", [0.2, 0.5, 0.8])
         self.grad_debug_step = 0
         self.gate_vis_counter = 0
         self.gate_vis_epoch = None
 
-    def _apply_gate_topk(self, gate: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        """Binarize gate for fusion: top-K pixels pass full features (where2comm-style)."""
-        if gate is None or not self.gate_topk_enabled:
+    def _apply_gate_alpha(
+        self,
+        gate: Optional[torch.Tensor],
+        alpha: float,
+    ) -> Optional[torch.Tensor]:
+        """Blend toward 1.0 early in training; fusion-only, gradients preserved."""
+        if gate is None:
+            return None
+        if not self.gate_alpha_enabled or alpha >= 1.0:
             return gate
-
-        batch_size, _, height, width = gate.shape
-        flat_gate = gate.reshape(batch_size, -1)
-
-        if self.training:
-            k = int(height * width * 0.05)   #TODO: 这里的k是随机生成的，需要根据实际情况调整
-            if k <= 0:
-                hard_mask = torch.zeros_like(gate)
-            else:
-                k = min(k, flat_gate.shape[-1])
-                _, indices = torch.topk(flat_gate, k=k, dim=-1, sorted=False)
-                binary_flat = torch.zeros_like(flat_gate)
-                binary_flat.scatter_(-1, indices, 1.0)
-                hard_mask = binary_flat.reshape(batch_size, 1, height, width)
-            # STE keeps gate_head trainable while forward uses hard top-K mask.
-            return hard_mask + gate - gate.detach()
-
-        return (gate > self.gate_inference_threshold).to(gate.dtype)
+        return (1.0 - alpha) + alpha * gate
 
     def _maybe_print_gate_schedule_debug(
         self,
         gate_outputs: Dict[str, Optional[torch.Tensor]],
         epoch: Optional[int] = None,
+        alpha: Optional[float] = None,
     ) -> None:
         if not self.training:
             return
-        print(f"[GateSchedule] epoch={epoch}")
+        print(f"[GateSchedule] epoch={epoch}, alpha={alpha:.4f}")
         for name, gate in (("rsu", gate_outputs.get("gate_rsu")), ("drone", gate_outputs.get("gate_drone"))):
             if not isinstance(gate, torch.Tensor):
                 continue
@@ -2103,9 +2138,8 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
         batch_dict: Optional[Dict[str, Any]],
         gate_outputs: Dict[str, Optional[torch.Tensor]],
         gate_inputs: Optional[Dict[str, Optional[Dict[str, torch.Tensor]]]] = None,
-        gate_fusion_outputs: Optional[Dict[str, Optional[torch.Tensor]]] = None,
     ) -> None:
-        """Save RSU / Drone final gate maps and selected structured gate inputs."""
+        """Save RSU / Drone final gate maps and their structured gate inputs."""
         if not self.training:
             return
         if batch_dict is None:
@@ -2153,9 +2187,6 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
         for agent_name, gate_tensor in pairs:
             if gate_tensor is None:
                 continue
-            fusion_gate_tensor = None
-            if self.gate_topk_enabled and gate_fusion_outputs is not None:
-                fusion_gate_tensor = gate_fusion_outputs.get(f"gate_{agent_name}")
             gate_cpu = gate_tensor.detach().float().cpu()
             if gate_cpu.dim() != 4 or gate_cpu.shape[1] != 1:
                 continue
@@ -2186,6 +2217,9 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
                         "feature_descriptor_mean",
                         "feature_descriptor_norm",
                         "reliability_descriptor_mean",
+                        "attention_conf",
+                        "mean_offset",
+                        "sample_agree",
                     ):
                         input_tensor = input_tensors.get(input_name)
                         if not isinstance(input_tensor, torch.Tensor):
@@ -2199,11 +2233,6 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
                             input_hw = input_cpu[sample_idx].mean(dim=0)
                         panels.append((input_name, input_hw.numpy(), input_hw))
                 panels.append(("gate_map", gate_np, gate_hw))
-                if isinstance(fusion_gate_tensor, torch.Tensor):
-                    fusion_cpu = fusion_gate_tensor.detach().float().cpu()
-                    if fusion_cpu.dim() == 4 and fusion_cpu.shape[1] == 1 and sample_idx < fusion_cpu.shape[0]:
-                        fusion_hw = fusion_cpu[sample_idx, 0]
-                        panels.append(("g_fusion", fusion_hw.numpy(), fusion_hw))
 
                 fig, axes = plt.subplots(
                     1,
@@ -2216,9 +2245,10 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
                 for ax, (panel_name, panel_np, panel_hw) in zip(axes, panels):
                     if panel_name in (
                         "gate_map",
-                        "g_fusion",
                         "feature_descriptor_mean",
                         "reliability_descriptor_mean",
+                        "attention_conf",
+                        "sample_agree",
                     ):
                         im = ax.imshow(panel_np, vmin=0.0, vmax=1.0, cmap=cmap)
                     else:
@@ -2464,9 +2494,10 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
             feature_vehicle,
         )
         
-        current_epoch = batch_dict.get('epoch', None) if batch_dict is not None else None
-        g_fusion_rsu = self._apply_gate_topk(g_final_rsu)
-        g_fusion_drone = self._apply_gate_topk(g_final_drone)
+        schedule_alpha = 1.0
+        current_epoch = batch_dict.get('epoch', None)
+        if self.training and self.gate_alpha_enabled and current_epoch < self.gate_alpha_warmup_epochs:
+            schedule_alpha = self.gate_alpha_list[current_epoch]
 
         if batch_dict is not None:
             batch_dict['fusion_gate_outputs'] = {
@@ -2482,6 +2513,7 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
                 self._maybe_print_gate_schedule_debug(
                     gate_outputs=batch_dict['fusion_gate_outputs'],
                     epoch=current_epoch,
+                    alpha=schedule_alpha,
                 )
                 # ===============================================
                 # ===== Gate map visualization for debugging =====
@@ -2489,13 +2521,12 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
                     batch_dict=batch_dict,
                     gate_outputs=batch_dict['fusion_gate_outputs'],
                     gate_inputs=batch_dict['fusion_gate_inputs'],
-                    gate_fusion_outputs={
-                        'gate_rsu': g_fusion_rsu if feature_rsu is not None else None,
-                        'gate_drone': g_fusion_drone if feature_drone is not None else None,
-                    } if self.gate_topk_enabled else None,
                 )
                 # ===============================================
             self.grad_debug_step += 1
+
+        g_fusion_rsu = self._apply_gate_alpha(g_final_rsu, schedule_alpha)
+        g_fusion_drone = self._apply_gate_alpha(g_final_drone, schedule_alpha)
 
         fused_feature = self.ego_fusion(
             refined_veh=refined_vehicle,
@@ -2504,7 +2535,11 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
             gate_rsu=g_fusion_rsu,
             gate_drone=g_fusion_drone,
         )
-        
+
+        # Read-only visualization export: does not alter fused_feature numerics.
+        if batch_dict is not None and bool(batch_dict.get("visualization_debug", False)):
+            batch_dict["pre_temporal_feature"] = fused_feature.detach()
+
         if self.sparse_temporal_fusion is not None:
             relative_pose = None if batch_dict is None else batch_dict.get('ego_pose')
             temporal_reset = False if batch_dict is None else bool(batch_dict.get('temporal_reset', False))
@@ -2530,6 +2565,9 @@ class OffsetGuidedSelectiveHierarchicalMambaFusionBlock(nn.Module):
                 aux_outputs["need_map"] = temporal_debug.get("need_map", None)
                 aux_outputs["window_scores"] = temporal_debug.get("window_scores", None)
                 aux_outputs["pixel_mask"] = temporal_debug.get("pixel_mask", None)
+                aux_outputs["window_mask"] = temporal_debug.get("window_mask", None)
+                aux_outputs["history_ready"] = temporal_debug.get("history_ready", None)
+                aux_outputs["temporal_applied"] = temporal_debug.get("temporal_applied", None)
                 batch_dict["fusion_aux_outputs"] = aux_outputs
 
         local_feature = self.local_mamba(fused_feature, return_aux=False)

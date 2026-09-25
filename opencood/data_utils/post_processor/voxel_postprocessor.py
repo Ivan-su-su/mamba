@@ -65,7 +65,20 @@ class VoxelPostprocessor(BasePostprocessor):
         cx, cy = np.meshgrid(x, y)
         cx = np.tile(cx[..., np.newaxis], self.anchor_num)  # center
         cy = np.tile(cy[..., np.newaxis], self.anchor_num)
-        cz = np.ones_like(cx) * -1.0
+        # TODO(drone-anchor-z): was hardcoded cz=-1.0 (OK for vehicle ego whose
+        # GT z≈-1, but breaks drone ego where GT z≈-60~-110). Mid-range for
+        # drone [-150,-6]->-78 still leaves |Δz|≈11 vs GT mean≈-89.
+        # Prefer yaml anchor_args.cz; else drone uses GT-mean -89; else mid z.
+        # Vehicle/rsu/collab (ego=vehicle) stay at mid-range cz=-1.0.
+        if "cz" in self.params["anchor_args"]:
+            cz_val = float(self.params["anchor_args"]["cz"])
+        elif self.params.get("ego_type") == "drone":
+            cz_val = -89.0
+        else:
+            z_min = float(self.lidar_range[2])
+            z_max = float(self.lidar_range[5])
+            cz_val = (z_min + z_max) / 2.0
+        cz = np.ones_like(cx) * cz_val
 
         w = np.ones_like(cx) * w
         l = np.ones_like(cx) * l
@@ -734,8 +747,8 @@ class VoxelPostprocessor(BasePostprocessor):
             C = getattr(self.params, "num_class", C)
             A = AC // C
 
-            psm = psm.view(B, C, A, H, W)
-            psm = psm.permute(0, 3, 4, 2, 1).contiguous()  # [1, H, W, A, C]
+            psm = psm.view(B, A, C, H, W)
+            psm = psm.permute(0, 3, 4, 1, 2).contiguous()  # [1, H, W, A, C] 与 loss 的 anchor-major 布局对齐
             prob = torch.sigmoid(psm)
             prob = prob.view(1, -1, C)  # [1, H*W*A, C]]
             prob = prob[:, :, 1:]

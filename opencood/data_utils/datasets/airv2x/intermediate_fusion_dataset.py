@@ -10,6 +10,7 @@ It will project the depth from lidar to image and pad noncover area with predict
 """
 
 import bisect
+import logging
 import math
 import random
 import time
@@ -131,6 +132,10 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         ).lower()
         self._shared_camera_aug_cache = None
 
+        # Corrupt-file skip: how many consecutive samples may fail before
+        # we give up (guards against silently looping a broken dataset).
+        self._max_corrupt_skips = 32
+
         self.pre_processor = build_preprocessor(params["preprocess"], train)
         self.post_processor = post_processor.build_postprocessor(
             params["postprocess"], dataset="airv2x", train=train
@@ -155,6 +160,96 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
             self.depth_downsample_factor = None
             # self.class_names =  ['car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier', 'motorcycle']
             self.class_names = ['car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier', 'motorcycle']
+        self._init_train_fog_sampler()
+
+    def _init_train_fog_sampler(self):
+        """Build eligible TRAIN indices and a shared epoch buffer for 40% fog.
+
+        Eligible = TRAIN timestamps whose scene is not the L2 night folder.
+        ``set_fog_epoch`` reseeds a permutation and keeps the first 40%
+        without replacement. The epoch buffer is shared so DataLoader
+        workers recompute the same set.
+        """
+        self._fog_eligible = []
+        self._fog_selected_idx = set()
+        self._fog_sel_epoch = -2
+        self._fog_epoch_buf = torch.tensor([-1], dtype=torch.long)
+        if not self.train:
+            return
+        n_sample = int(self.len_record[-1]) if self.len_record else 0
+        for idx in range(n_sample):
+            meta_path = self._metadata_path_for_idx(idx)
+            if camera_utils.is_l2_train_night_scenario(meta_path, True):
+                continue
+            self._fog_eligible.append(idx)
+        try:
+            self._fog_epoch_buf.share_memory_()
+        except RuntimeError:
+            pass
+        print(
+            "[fog] TRAIN eligible (non-night) = %d / %d; "
+            "each epoch samples %.0f%% without replacement"
+            % (
+                len(self._fog_eligible),
+                n_sample,
+                100.0 * camera_utils.FOG_SAMPLE_FRACTION,
+            )
+        )
+
+    def _metadata_path_for_idx(self, idx):
+        """Return one metadata path for dataset index ``idx`` (no image IO)."""
+        _, _, timestamp_key = self._resolve_index(idx)
+        scenario_index = 0
+        for i, ele in enumerate(self.len_record):
+            if idx < ele:
+                scenario_index = i
+                break
+        scenario_database = self.scenario_database[scenario_index]
+        first_cav = next(iter(scenario_database.values()))
+        return first_cav[timestamp_key]["metadata_path"]
+
+    def set_fog_epoch(self, epoch):
+        """Resample the 40% fog index set for this epoch. TRAIN only."""
+        if not self.train:
+            return
+        self._fog_epoch_buf.fill_(int(epoch))
+        self._sync_fog_selection()
+        n_elig = len(self._fog_eligible)
+        n_sel = len(self._fog_selected_idx)
+        print(
+            "[fog] epoch=%d eligible=%d selected=%d (%.1f%%)"
+            % (int(epoch), n_elig, n_sel, 100.0 * n_sel / max(n_elig, 1))
+        )
+
+    def _sync_fog_selection(self):
+        """Rebuild the selected-index set from the shared epoch id."""
+        epoch = int(self._fog_epoch_buf.item())
+        if epoch == self._fog_sel_epoch:
+            return
+        eligible = self._fog_eligible
+        if not eligible or epoch < 0:
+            self._fog_selected_idx = set()
+            self._fog_sel_epoch = epoch
+            return
+        rng = np.random.RandomState(camera_utils.FOG_EPOCH_SEED + int(epoch))
+        perm = rng.permutation(np.asarray(eligible, dtype=np.int64))
+        n_sel = int(round(camera_utils.FOG_SAMPLE_FRACTION * len(eligible)))
+        self._fog_selected_idx = set(perm[:n_sel].tolist())
+        self._fog_sel_epoch = epoch
+
+    def _sample_uses_fog(self, idx):
+        """True iff TRAIN, non-night, and idx is in this epoch's 40% set."""
+        if not self.train:
+            return False
+        self._sync_fog_selection()
+        return idx in self._fog_selected_idx
+
+    def _sample_fog_betas(self):
+        """One beta per agent type for all cameras of that type in the sample."""
+        betas = {}
+        for agent_type, (lo, hi) in camera_utils.FOG_BETA_RANGE.items():
+            betas[agent_type] = float(np.random.uniform(lo, hi))
+        return betas
 
     def _resolve_index(self, idx):
         """Return scenario and local timestamp metadata for a global index."""
@@ -177,7 +272,45 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
             and self.temporal_training_mode == "queue"
         ):
             return self._get_temporal_queue_item(idx)
-        return self._get_single_item(idx)
+        return self._get_single_item_skip_corrupt(idx)
+
+    def _get_single_item_skip_corrupt(self, idx):
+        """Wrap ``_get_single_item`` with skip-and-retry on corrupt data files.
+
+        Corrupt PNGs / unreadable files raise ``OSError`` in the DataLoader
+        worker and kill the whole training run. Here we log a warning and
+        serve the next index instead, so training keeps going. Only the
+        current sample is dropped; the batch stays full.
+
+        Args:
+            idx: Original sample index.
+
+        Returns:
+            The first successfully loaded sample starting at ``idx``.
+
+        Raises:
+            RuntimeError: If too many consecutive samples fail (likely a
+                code bug rather than corrupt files).
+        """
+        logger = logging.getLogger(__name__)
+        n = len(self)
+        for attempt in range(self._max_corrupt_skips):
+            try:
+                return self._get_single_item(idx)
+            except (OSError, SyntaxError, ValueError) as e:
+                # PIL raises OSError/SyntaxError for broken images; np/torch
+                # raise ValueError for malformed binary arrays.
+                logger.warning(
+                    "Skipping corrupt sample idx=%d (%s: %s); trying idx=%d",
+                    idx,
+                    type(e).__name__,
+                    e,
+                )
+                idx = (idx + 1) % n
+        raise RuntimeError(
+            f"{self._max_corrupt_skips} consecutive samples failed at idx={idx}; "
+            "aborting to avoid silently looping over a broken dataset."
+        )
 
     def _get_temporal_queue_item(self, idx):
         """Build a two-frame queue with shared camera geometric augmentation."""
@@ -268,11 +401,10 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         dynamic_seg_label = None
         static_seg_label = None
         metadata_path = None
-        weather_state = camera_utils.sample_weather_augmentation(
-            self.weather_aug_conf, self.train
-        )
 
         too_far = []
+        apply_fog = self._sample_uses_fog(idx)
+        fog_betas = self._sample_fog_betas() if apply_fog else None
 
         # Collect data for each agent
         for cav_id, selected_cav_base in base_data_dict.items():
@@ -283,9 +415,15 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
             if distance > agent_data[agent_type]["com_range"]:
                 too_far.append(cav_id)
                 continue
-                
+
+            fog_beta = None
+            if apply_fog and fog_betas is not None:
+                fog_beta = fog_betas.get(agent_type)
             selected_cav_processed, img_process_info= self.get_item_single_car(
-                selected_cav_base, ego_lidar_pose, weather_state
+                selected_cav_base,
+                ego_lidar_pose,
+                apply_fog=apply_fog,
+                fog_beta=fog_beta,
             )
             # Add data to the appropriate agent collection
             current_agent = agent_data[agent_type]
@@ -544,7 +682,9 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
             cache[key] = camera_utils.sample_augmentation(data_aug_conf, self.train)
         return cache[key]
 
-    def get_item_single_car(self, selected_cav_base, ego_pose, weather_state=None):
+    def get_item_single_car(
+        self, selected_cav_base, ego_pose, apply_fog=False, fog_beta=None
+    ):
         """
         Project the lidar and bbx to ego space first, and then do clipping.
 
@@ -582,8 +722,15 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         depth_data_list = selected_cav_base.get("depth", [])
         camera_paths_list = selected_cav_base.get("camera_paths", [])  # 相机文件路径
         params = selected_cav_base["params"]
+        camera_world_z = torch.from_numpy(
+            airv2x_utils.compute_camera_world_z(params, agent_type)
+        )
 
         N = len(camera_data_list)
+        if int(camera_world_z.shape[0]) != N:
+            raise AssertionError(
+                f"{agent_type} camera_world_z n={int(camera_world_z.shape[0])} vs Ncam={N}"
+            )
         camera_to_lidar_matrix = params["delay_extrinsic"].reshape(N, 4, 4)
         camera_intrinsics = params["delay_intrinsic"].reshape(N, 3, 3)
         # import pdb; pdb.set_trace()
@@ -656,10 +803,8 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
                 flip=flip,
                 rotate=rotate,
             )
-            img_src[0] = camera_utils.apply_weather_augmentation(
-                img_src[0],
-                weather_state,
-                depth_image=img_src[1] if depth_data_list else None,
+            apply_l2 = camera_utils.is_l2_train_night_scenario(
+                selected_cav_base.get("metadata_path"), self.train
             )
 
             # 对语义真值应用相同的数据增强
@@ -694,9 +839,41 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
             post_tran[:2] = post_tran2
             post_rot[:2, :2] = post_rot2
 
-            img_src[0] = camera_utils.normalize_img(img_src[0])
-            if depth_data_list:
-                img_src[1] = camera_utils.pil_depth_to_tensor(img_src[-1]).unsqueeze(0)
+            if apply_l2:
+                img_src[0] = camera_utils.encode_rgb_for_p1(
+                    img_src[0], apply_l2=True, train=self.train
+                )
+                if depth_data_list:
+                    img_src[1] = camera_utils.pil_depth_to_tensor(
+                        img_src[-1]
+                    ).unsqueeze(0)
+            elif (
+                apply_fog
+                and fog_beta is not None
+                and depth_data_list
+                and self.train
+            ):
+                depth_t = camera_utils.pil_depth_to_tensor(img_src[-1])
+                rgb_t = to_tensor(img_src[0])
+                rho = camera_utils.camera_optical_ray_range(
+                    depth_t, intrin, post_rot, post_tran
+                )
+                rgb_t = camera_utils.apply_atmospheric_fog_rgb(
+                    rgb_t,
+                    rho,
+                    fog_beta,
+                    atmospheric_light=camera_utils.FOG_ATMOSPHERIC_LIGHT,
+                )
+                img_src[0] = camera_utils.imagenet_normalize_display_rgb(rgb_t)
+                img_src[1] = depth_t.unsqueeze(0)
+            else:
+                img_src[0] = camera_utils.encode_rgb_for_p1(
+                    img_src[0], apply_l2=False
+                )
+                if depth_data_list:
+                    img_src[1] = camera_utils.pil_depth_to_tensor(
+                        img_src[-1]
+                    ).unsqueeze(0)
                 
 
             imgs.append(torch.cat(img_src, dim=0))
@@ -717,6 +894,7 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
             "post_rots": torch.stack(post_rots),
             "post_trans": torch.stack(post_trans),
             "original_imgs": torch.stack(original_imgs),  # [Ncam, 3, H_orig, W_orig] 原始图像（未经过变换）
+            "camera_world_z": camera_world_z,
         }
         
         # 如果加载了图片语义真值，添加到字典中
@@ -1364,9 +1542,9 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
             shape: (L, L, 4, 4)
         """
         identity_pairwise_t_matrix = np.zeros((max_cav, max_cav, 4, 4))
-        # this one is used for images when proj_first
-        # proj_first only converts lidar to ego coordinate
-        # but the cameras features are still in its own coordinate
+        # With proj_first, both LiDAR points and camera extrinsics are already
+        # expressed in the ego LiDAR frame, so fusion must use identity.
+        # The physical matrices remain available for proj_first=False.
         pairwise_t_matrix = np.zeros((max_cav, max_cav, 4, 4))
 
         # if lidar projected to ego first, then the pairwise matrix

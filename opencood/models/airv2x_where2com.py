@@ -13,7 +13,8 @@ from opencood.models.common_modules.naive_compress import NaiveCompressor
 from opencood.models.common_modules.airv2x_encoder import LiftSplatShootEncoder
 from opencood.models.common_modules.airv2x_base_model import Airv2xBase
 from opencood.models.where2comm_modules.where2comm_fuse import Where2comm
-from opencood.models.task_heads.segmentation_head import BevSegHead 
+from opencood.models.task_heads.segmentation_head import BevSegHead
+from opencood.utils.bev_corruption import label_packed_transmission_maps
 
 
 class Airv2xWhere2com(Airv2xBase):
@@ -165,6 +166,15 @@ class Airv2xWhere2com(Airv2xBase):
         if self.shrink_flag:
             batch_spatial_features_2d = self.shrink_conv(batch_spatial_features_2d)
 
+        # Corrupt collaborator BEV immediately before fusion (fair vs MambaFusion).
+        # Apply to both 2d features and multi-scale spatial_features.
+        batch_spatial_features_2d = self.maybe_corrupt_pre_fusion(
+            batch_spatial_features_2d, data_dict
+        )
+        batch_dict["spatial_features"] = self.maybe_corrupt_pre_fusion(
+            batch_dict["spatial_features"], data_dict
+        )
+
         output_dict = {}
         if self.args["task"] == "det":
             # determine where2comm
@@ -176,7 +186,7 @@ class Airv2xWhere2com(Airv2xBase):
                 )
 
             if self.multi_scale:
-                fused_feature, communication_rates = self.fusion_net(
+                fused_feature, communication_rates, communication_masks = self.fusion_net(
                     batch_dict["spatial_features"],
                     psm,
                     batch_record_len,
@@ -187,7 +197,7 @@ class Airv2xWhere2com(Airv2xBase):
                 if self.shrink_flag:
                     fused_feature = self.shrink_conv(fused_feature)
             else:
-                fused_feature, communication_rates = self.fusion_net(
+                fused_feature, communication_rates, communication_masks = self.fusion_net(
                     batch_spatial_features_2d, psm, batch_record_len, pairwise_t_matrix
                 )
 
@@ -199,10 +209,22 @@ class Airv2xWhere2com(Airv2xBase):
             if self.args["obj_head"]:
                 obj = self.obj_head(fused_feature)
                 output_dict.update({"obj": obj})
+            for k, v in batch_dict.items():
+                if k.startswith("depth_items"):
+                    output_dict[k] = v
 
             output_dict.update(
                 {"mask": 0, "com": communication_rates, "comm_rate": comm_rates}
             )
+            if communication_masks is not None:
+                output_dict["communication_masks"] = communication_masks
+                output_dict["transmission_maps"] = label_packed_transmission_maps(
+                    communication_masks,
+                    data_dict,
+                    collaborators=self.collaborators,
+                )
+            if "_bev_corrupt_maps" in data_dict:
+                output_dict["bev_corrupt_maps"] = data_dict["_bev_corrupt_maps"]
 
         elif self.args["task"] == "seg":
             _, ori_x = self.seg_head(batch_spatial_features_2d, True)
@@ -212,7 +234,7 @@ class Airv2xWhere2com(Airv2xBase):
                 )
 
             if self.multi_scale:
-                fused_feature, communication_rates = self.fusion_net(
+                fused_feature, communication_rates, communication_masks = self.fusion_net(
                     batch_dict["spatial_features"],
                     ori_x,
                     batch_record_len,
@@ -223,7 +245,7 @@ class Airv2xWhere2com(Airv2xBase):
                 if self.shrink_flag:
                     fused_feature = self.shrink_conv(fused_feature)
             else:
-                fused_feature, communication_rates = self.fusion_net(
+                fused_feature, communication_rates, communication_masks = self.fusion_net(
                     batch_spatial_features_2d,
                     ori_x,
                     batch_record_len,
@@ -250,4 +272,13 @@ class Airv2xWhere2com(Airv2xBase):
             output_dict.update(
                 {"mask": 0, "com": communication_rates, "comm_rate": comm_rates}
             )
+            if communication_masks is not None:
+                output_dict["communication_masks"] = communication_masks
+                output_dict["transmission_maps"] = label_packed_transmission_maps(
+                    communication_masks,
+                    data_dict,
+                    collaborators=self.collaborators,
+                )
+            if "_bev_corrupt_maps" in data_dict:
+                output_dict["bev_corrupt_maps"] = data_dict["_bev_corrupt_maps"]
         return output_dict

@@ -642,14 +642,25 @@ def main():
     # Load checkpoint if continuing training
     if opt.model_dir:
         saved_path = opt.model_dir
-        init_epoch, _ = resume_training_from_checkpoint(
-            saved_path=saved_path,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
-            device=device,
+        # 兼容旧格式（纯 state_dict，无 epoch/optimizer 字段，如早期 HEAL 保存）
+        latest_ckpt = torch.load(
+            find_latest_checkpoint(saved_path), map_location="cpu"
         )
+        if isinstance(latest_ckpt, dict) and "epoch" in latest_ckpt:
+            init_epoch, _ = resume_training_from_checkpoint(
+                saved_path=saved_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                device=device,
+            )
+        else:
+            print(
+                "Legacy checkpoint detected (raw state_dict); "
+                "falling back to load_saved_model (optimizer/scheduler re-init)."
+            )
+            init_epoch, model = train_utils.load_saved_model(saved_path, model)
         if temporal_cfg["enable"] and temporal_cfg["load_from"].strip():
             mask_names = collect_temporal_loaded_parameter_names(
                 model, temporal_cfg["load_from"].strip(), device
@@ -674,6 +685,8 @@ def main():
     for epoch in range(init_epoch, epochs):
         if opt.distributed and isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
+        if hasattr(train_dataset, "set_fog_epoch"):
+            train_dataset.set_fog_epoch(epoch)
 
         # Print current learning rate
         current_lr = optimizer.param_groups[0]["lr"]

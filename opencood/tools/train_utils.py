@@ -57,6 +57,7 @@ def load_saved_model(saved_path, model, epoch=None):
             for file_ in file_list:
                 result = re.findall(".*epoch(.*).pth.*", file_)
                 epochs_exist.append(int(result[0]))
+            initial_epoch_ = max(epochs_exist)
         else:
             initial_epoch_ = 0
         return initial_epoch_

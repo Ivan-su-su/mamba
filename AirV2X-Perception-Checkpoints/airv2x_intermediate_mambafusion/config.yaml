@@ -197,7 +197,7 @@ loss:
       # recall_weight: 0.1 #TODO
       GATE_FOREGROUND_AUX_LOSS:
         ENABLED: True
-        LOSS_WEIGHT: 1.0
+        LOSS_WEIGHT: 1.5
         WARMUP_EPOCHS: 20
         LOSS_TYPE: "focal_bce"
         # ALPHA: 0.5
@@ -416,7 +416,7 @@ model:
         YBOUND: [[-40.0, 40.0, 0.4], [-40.0, 40.0, 0.4], [-40.0, 40.0, 0.4]]     # 80 / 200
         ZBOUND: [[-10.0,10.0, 20.0], [-30.0,30.0, 60.0], [-150.0,-6.0, 144.0]]
         #DBOUND: [1.0, 60.0, 0.5]
-        DBOUND: [[2.0, 50.0, 1.0], [2.0, 50.0, 0.5], [6.0, 150.0, 1.0]]   #TODO
+        DBOUND: [[2.0, 50.0, 1.0], [2.0, 50.0, 0.5], [6.0, 150.0, 0.5]]
         DOWNSAMPLE: 1
         BEV_SIZE_H: *id011
         BEV_SIZE_W: *id012
@@ -455,11 +455,13 @@ model:
           SAMPLE_DA_LAYER_SCALE_INIT: 3e-2
           FINAL_GATE_HIDDEN_DIM: 32
           FINAL_GATE_COMPARE_DIM: 8
-          GATE_TOPK:
-            TOPK_ENABLED: True
-            INFERENCE_THRESHOLD: 0.7
+          GATE_ALPHA:
+            ENABLED: False   # 从一开始就让gate_head承担全部输出
+            WARMUP_EPOCHS: 3
+            ALPHA_LIST: [0.2, 0.5, 0.8]
         SPARSE_TEMPORAL:
           ENABLE: True
+          TYPE: concat
           CUE_DISTANCE_CHANNELS: 3
           POINT_CLOUD_RANGE: [-140.8, -40.0, -3.0, 140.8, 40.0, 1.0]
           ROUTE_WINDOW: [10, 11]
@@ -692,7 +694,7 @@ train_params:
   max_grad_norm: 1.0  # 梯度裁剪
 temporal_training:
   enable: true
-  load_from: "/home/dell/suyi/AirV2X-Perception_copy/opencood/logs/airv2x_intermediate_mambafusion/default_2026_05_08_18_01_50"
+  load_from: "/home/dell/suyi/AirV2X-Perception_copy/opencood/logs/airv2x_intermediate_mambafusion/baseline_sparse"
   mode: queue
 postprocess:
   anchor_args:

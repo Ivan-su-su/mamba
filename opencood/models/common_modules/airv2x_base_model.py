@@ -3,6 +3,7 @@
 # License: TDG-Attribution-NonCommercial-NoDistrib
 
 from collections import defaultdict, OrderedDict
+from typing import Any, Dict
 
 import torch
 import torch.nn as nn
@@ -11,6 +12,7 @@ import numpy as np
 from opencood.models.common_modules.point_pillar_scatter import PointPillarScatter
 from opencood.models.common_modules.airv2x_encoder import LiftSplatShootEncoder
 from opencood.models.common_modules.airv2x_pillar_vfe import PillarVFE
+from opencood.utils.bev_corruption import corrupt_packed_bev_pre_fusion, should_drop_agent
 
 
 import torch
@@ -98,6 +100,26 @@ class Airv2xBase(nn.Module):
                 else:
                     raise NotImplementedError(f"Modality {m} not supported for drone.")
 
+    def get_fusion_pairwise_t_matrix(
+        self, data_dict: Dict[str, Any]
+    ) -> torch.Tensor:
+        """Select the transform used by multi-agent BEV fusion.
+
+        With ``proj_first=True``, camera and LiDAR inputs are projected into
+        the ego LiDAR frame before their encoders run. Fusion must therefore
+        use the identity matrices in ``pairwise_t_matrix_collab``; applying
+        the physical agent transforms again would warp non-ego features twice.
+
+        Args:
+            data_dict: Batched model inputs containing both pairwise matrices.
+
+        Returns:
+            Pairwise transformation tensor for the fusion module.
+        """
+        if bool(self.args.get("proj_first", False)):
+            return data_dict["pairwise_t_matrix_collab"]
+        return data_dict["img_pairwise_t_matrix_collab"]
+
     def extract_features(self, data_dict):
         """
         Extract and aggregate features from each collaborating agent.
@@ -125,30 +147,41 @@ class Airv2xBase(nn.Module):
             A tensor indicating the number of records aggregated per batch sample.
         """
         batch_dicts = OrderedDict()
+        corrupt_cfg = data_dict.get("bev_corrupt_cfg", None)
+        depth_items_out = {}
         if "vehicle" in self.collaborators and len(data_dict["vehicle"]["batch_idxs"]) > 0:
             assert self.veh_models is not None, "Vehicle model is not initialized."
-            output_dict_veh = []
-           
-            for v_model in self.veh_models:
-                output_dict_veh.append(v_model(data_dict))
-            output_dict_veh = self.fuse_bev(output_dict_veh)
-            batch_dicts["vehicle"] = output_dict_veh
+            if not should_drop_agent(corrupt_cfg, "vehicle"):
+                output_dict_veh = []
+               
+                for v_model in self.veh_models:
+                    output_dict_veh.append(v_model(data_dict))
+                if output_dict_veh and "depth_items" in output_dict_veh[0]:
+                    depth_items_out["depth_items"] = output_dict_veh[0].pop("depth_items")
+                output_dict_veh = self.fuse_bev(output_dict_veh)
+                batch_dicts["vehicle"] = output_dict_veh
             
         if "rsu" in self.collaborators and len(data_dict["rsu"]["batch_idxs"]) > 0:
             assert self.rsu_models is not None, "RSU model is not initialized."
-            output_dict_rsu = []
-            for r_model in self.rsu_models:
-                output_dict_rsu.append(r_model(data_dict))
-            output_dict_rsu = self.fuse_bev(output_dict_rsu)
-            batch_dicts["rsu"] = output_dict_rsu
+            if not should_drop_agent(corrupt_cfg, "rsu"):
+                output_dict_rsu = []
+                for r_model in self.rsu_models:
+                    output_dict_rsu.append(r_model(data_dict))
+                if output_dict_rsu and "depth_items" in output_dict_rsu[0]:
+                    depth_items_out["depth_items_rsu"] = output_dict_rsu[0].pop("depth_items")
+                output_dict_rsu = self.fuse_bev(output_dict_rsu)
+                batch_dicts["rsu"] = output_dict_rsu
             
         if "drone" in self.collaborators and len(data_dict["drone"]["batch_idxs"]) > 0:
             assert self.drone_models is not None, "Drone model is not initialized."
-            output_dict_drone = []
-            for d_model in self.drone_models:
-                output_dict_drone.append(d_model(data_dict))
-            output_dict_drone = self.fuse_bev(output_dict_drone)
-            batch_dicts["drone"] = output_dict_drone
+            if not should_drop_agent(corrupt_cfg, "drone"):
+                output_dict_drone = []
+                for d_model in self.drone_models:
+                    output_dict_drone.append(d_model(data_dict))
+                if output_dict_drone and "depth_items" in output_dict_drone[0]:
+                    depth_items_out["depth_items_drone"] = output_dict_drone[0].pop("depth_items")
+                output_dict_drone = self.fuse_bev(output_dict_drone)
+                batch_dicts["drone"] = output_dict_drone
 
         # Normally, all agent types has the same batch size, but if one type of agent is not in the collaborator list,
         # the batch size of that agent type will be 0. So we need to find the maximum batch size among all agent types.
@@ -157,14 +190,36 @@ class Airv2xBase(nn.Module):
                     len(data_dict["drone"]["batch_idxs"]))
 
         batch_output_dict, batch_record_len = self.repack_batch(batch_dicts, data_dict, B)
+        batch_output_dict.update(depth_items_out)
 
         assert (
             batch_output_dict["spatial_features"].shape[0]
             == batch_record_len.sum().item()
         ), f"{batch_output_dict['spatial_features'].shape}, {batch_record_len}"
         return batch_output_dict, batch_record_len
-    
-    
+
+    def maybe_corrupt_pre_fusion(
+        self,
+        feat: torch.Tensor,
+        data_dict: dict,
+    ) -> torch.Tensor:
+        """Corrupt packed collaborator BEV right before multi-agent fusion.
+
+        No-op when ``bev_corrupt_cfg`` is absent or disabled. Used by
+        V2X-ViT / Where2com / CoBEVT so the injection stage matches MambaFusion.
+        """
+        corrupt_cfg = data_dict.get("bev_corrupt_cfg", None)
+        if corrupt_cfg is None or not getattr(corrupt_cfg, "enabled", False):
+            return feat
+        sample_id = data_dict.get("bev_corrupt_sample_id", "unknown_sample")
+        return corrupt_packed_bev_pre_fusion(
+            feat,
+            data_dict,
+            corrupt_cfg,
+            sample_id,
+            collaborators=self.collaborators,
+        )
+
     def fuse_bev(self, batch_dict_list: list):
         # For here, only "spatial_features" is used for the future module, so we only keep this one
         fused_batch_dict = {

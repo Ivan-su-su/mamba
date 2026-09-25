@@ -10,7 +10,8 @@ name: airv2x_HEAL_drone_lidar
 
 active_sensors: &active_sensors ["lidar"]
 collaborators: &collaborators ["drone"]
-ego_type: &ego_type drone
+# Vehicle ego frame (same as collab); only drone lidar is consumed.
+ego_type: &ego_type vehicle
 bevcam_fov: 110
 
 yaml_parser: "load_airv2x_params" # add support for airv2x
@@ -32,9 +33,9 @@ train: &train True
 # Dataset #
 ###########
 
-root_dir: 'dataset/airv2x/train'
-validate_dir: 'dataset/airv2x/val'
-test_dir: 'dataset/airv2x/test'
+root_dir: '/home/dell/suyi/AirV2X-Perception/train/train'
+validate_dir: '/home/dell/suyi/AirV2X-Perception/val/val'
+test_dir: '/home/dell/suyi/AirV2X-Perception/test/test'
 num_class: &num_class 7
 num_anchor: &num_anchor 2
 
@@ -82,7 +83,7 @@ fusion:
     drone_grid_conf: &drone_grid_conf
       xbound: [-140.8, 140.8, 0.4]  
       ybound: [-40, 40, 0.4] 
-      zbound: [-150, -6, 144] 
+      zbound: [-10, 10, 20.0] 
       ddiscr: [6, 150, 144]
       mode: 'UD'
     drone_data_aug_conf: &drone_data_aug_conf_image
@@ -111,12 +112,12 @@ preprocess:
   core_method: 'SpVoxelPreprocessor'
   ego_type: *ego_type
   args:
-    voxel_size: &voxel_size [0.4, 0.4, 144] # Use ego type
+    voxel_size: &voxel_size [0.4, 0.4, 4] # vehicle-ego
     max_points_per_voxel: 32
     max_voxel_train: 32000
     max_voxel_test: 70000
-  # lidar range for each agent
-  cav_lidar_range: &cav_lidar [-140.8, -40, -150, 140.8, 40, -6] # Use ego type    
+  # lidar range in vehicle ego after proj_first
+  cav_lidar_range: &cav_lidar [-140.8, -40, -3, 140.8, 40, 1]    
 
 # anchor box related
 postprocess:
@@ -218,8 +219,8 @@ model:
       modalities: ["lidar"]  # "cam", "lidar"
 
       lidar:
-        voxel_size: &drone_voxel_size [0.4, 0.4, 144]
-        lidar_range: &drone_lidar [-140.8, -40, -150, 140.8, 40, -6]
+        voxel_size: &drone_voxel_size [0.4, 0.4, 4]
+        lidar_range: &drone_lidar [-140.8, -40, -3, 140.8, 40, 1]
         compression: 0 # compression rate
         backbone_fix: false
         pillar_vfe:

@@ -145,6 +145,11 @@ class Airv2xV2XVit(Airv2xBase):
         if self.compression:
             spatial_features_2d = self.naive_compressor(spatial_features_2d)
 
+        # Corrupt collaborator BEV immediately before fusion (fair vs MambaFusion).
+        spatial_features_2d = self.maybe_corrupt_pre_fusion(
+            spatial_features_2d, data_dict
+        )
+
         regroup_feature, mask = regroup(
             spatial_features_2d, batch_record_len, self.max_cav_num
         )

@@ -250,6 +250,8 @@ class Where2comm(nn.Module):
 
         if self.multi_scale:
             ups = []
+            communication_masks = None
+            communication_rates = torch.tensor(1).to(x.device)
 
             for i in range(self.num_levels):
                 x = backbone.blocks[i](x)
@@ -258,6 +260,9 @@ class Where2comm(nn.Module):
                 if i == 0:
                     if self.fully:
                         communication_rates = torch.tensor(1).to(x.device)
+                        communication_masks = torch.ones(
+                            x.shape[0], 1, x.shape[2], x.shape[3], device=x.device
+                        )
                     else:
                         # Prune
                         batch_confidence_maps = self.regroup(psm_single, record_len)
@@ -305,6 +310,9 @@ class Where2comm(nn.Module):
             # 1. Communication (mask the features)
             if self.fully:
                 communication_rates = torch.tensor(1).to(x.device)
+                communication_masks = torch.ones(
+                    x.shape[0], 1, x.shape[2], x.shape[3], device=x.device
+                )
             else:
                 # Prune
                 batch_confidence_maps = self.regroup(psm_single, record_len)
@@ -325,4 +333,4 @@ class Where2comm(nn.Module):
             for b in range(B):
                 x_fuse.append(self.fuse_modules(warped_features[b]))
             x_fuse = torch.stack(x_fuse)
-        return x_fuse, communication_rates
+        return x_fuse, communication_rates, communication_masks

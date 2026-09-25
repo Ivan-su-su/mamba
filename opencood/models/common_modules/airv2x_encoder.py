@@ -332,6 +332,8 @@ class LiftSplatShootEncoder(nn.Module):
             "spatial_features": x,
             "spatial_features_3d": x.unsqueeze(2),
         }
+        if depth_items is not None:
+            output_dict["depth_items"] = depth_items
         return output_dict
 
 

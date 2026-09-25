@@ -5,6 +5,7 @@ from opencood.models.mambafusion_modules.backbones_image import img_neck
 from opencood.models.mambafusion_modules.backbones_2d import fuser, map_to_bev
 from opencood.models.mambafusion_modules.spconv_utils import find_all_spconv_keys
 from opencood.models.mambafusion_modules.vmamba import build_vssm_model
+from opencood.utils.bev_corruption import filter_agents_for_drop
 import torch.profiler
 import torch.nn.functional as F
 from easydict import EasyDict
@@ -345,6 +346,11 @@ class Airv2xMambafusion(Detector3DTemplate):
             agent_idx[agent] = count
             count += batch_dict[agent]['record_len'].item()
         
+        # w/o agent ablation: drop from available_agents so fusion gets None (not zeros).
+        available_agents = filter_agents_for_drop(
+            available_agents, batch_dict.get("bev_corrupt_cfg", None)
+        )
+
         # AirV2X需要agent循环处理，但要保持数据流一致
         print("available_agents:",available_agents)
         batch_dict = self.pre_process(agent_idx, available_agents, batch_dict)
@@ -400,6 +406,12 @@ class Airv2xMambafusion(Detector3DTemplate):
             output_dict['fusion_aux_outputs'] = batch_dict['fusion_aux_outputs']
         if 'fusion_gate_outputs' in batch_dict:
             output_dict['fusion_gate_outputs'] = batch_dict['fusion_gate_outputs']
+        if '_bev_corrupt_maps' in batch_dict:
+            output_dict['bev_corrupt_maps'] = batch_dict['_bev_corrupt_maps']
+        if 'pre_temporal_feature' in batch_dict:
+            output_dict['pre_temporal_feature'] = batch_dict['pre_temporal_feature']
+        if 'corrupted_drone_bev' in batch_dict:
+            output_dict['corrupted_drone_bev'] = batch_dict['corrupted_drone_bev']
         if 'epoch' in batch_dict:
             output_dict['epoch'] = batch_dict['epoch']
 

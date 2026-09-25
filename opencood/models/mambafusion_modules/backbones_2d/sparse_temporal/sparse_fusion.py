@@ -67,6 +67,27 @@ class TemporalNeedHead(nn.Module):
         )
         nn.init.constant_(self.residual_head[-1].bias, 0.0)
 
+    def _normalize_single_map(
+        self,
+        value: Optional[torch.Tensor],
+        batch_size: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Normalize one optional aux map into `[B, 1, H, W]`."""
+        if value is None:
+            return torch.zeros(batch_size, 1, height, width, device=device, dtype=dtype)
+        if value.dim() != 4 or value.shape[1] != 1:
+            raise ValueError(f"Expected [B, 1, H, W], got {value.shape}")
+        if value.shape[0] != batch_size or value.shape[2:] != (height, width):
+            raise ValueError(
+                "Aux map spatial/batch shape must match current feature, "
+                f"got aux={value.shape}, feature={[batch_size, height, width]}"
+            )
+        return value.to(device=device, dtype=dtype)
+
     def forward(
         self,
         current_feature: torch.Tensor,
@@ -89,20 +110,24 @@ class TemporalNeedHead(nn.Module):
                 - confidence map `[B, 1, H, W]`
                 - temporal need map `[B, 1, H, W]`
         """
+        if current_feature.dim() != 4:
+            raise ValueError(f"current_feature must be [B, C, H, W], got {current_feature.shape}")
         batch_size, _, height, width = current_feature.shape
         device = current_feature.device
         dtype = current_feature.dtype
         # distance_drone / distance_rsu are kept for backward compatibility,
         # but are no longer used by the new foreground-prior temporal need head.
 
-        if gate_drone is None:
-            gate_drone = torch.zeros(batch_size, 1, height, width, device=device, dtype=dtype)
-        if gate_rsu is None:
-            gate_rsu = torch.zeros(batch_size, 1, height, width, device=device, dtype=dtype)
+        normalized_gate_drone = self._normalize_single_map(
+            gate_drone, batch_size, height, width, device, dtype
+        )
+        normalized_gate_rsu = self._normalize_single_map(
+            gate_rsu, batch_size, height, width, device, dtype
+        )
 
-        gate_max = torch.maximum(gate_drone, gate_rsu)
-        gate_sum = torch.clamp(gate_drone + gate_rsu, 0.0, 1.0)
-        gate_disagreement = torch.abs(gate_drone - gate_rsu)
+        gate_max = torch.maximum(normalized_gate_drone, normalized_gate_rsu)
+        gate_sum = torch.clamp(normalized_gate_drone + normalized_gate_rsu, 0.0, 1.0)
+        gate_disagreement = torch.abs(normalized_gate_drone - normalized_gate_rsu)
 
         current_desc = self.current_feature_encoder(current_feature)
         need_input = torch.cat(
@@ -636,6 +661,8 @@ class SparseTemporalFusionBlock(nn.Module):
         base_motion_epsilon: float = 0.5,
         base_fixed_expansion_no_motion: float = 1.0,
         include_diagonal_base_offsets: bool = False,
+        offset_mode: str = 'guided',
+        direct_offset_range: Optional[float] = None,
         align_corners: bool = False,
         padding_mode: str = 'zeros',
         return_debug: bool = False,
@@ -645,6 +672,8 @@ class SparseTemporalFusionBlock(nn.Module):
         Args:
             channels: BEV feature channel count.
             num_points: Number of sparse temporal retrieval points.
+                - `guided`: residual points per motion base direction.
+                - `direct`: total freely predicted sampling points.
             cue_distance_channels: Channel count of each `distance_*` map passed to
                 `TemporalNeedHead` (stacked spatial-fusion cues per source).
             point_cloud_range: BEV range `[x_min, y_min, z_min, x_max, y_max, z_max]`.
@@ -657,7 +686,7 @@ class SparseTemporalFusionBlock(nn.Module):
             need_residual_channels: Hidden width of the temporal need residual head.
             need_prior_clamp_min: Lower clamp for detached gate prior before logit conversion.
             need_prior_clamp_max: Upper clamp for detached gate prior before logit conversion.
-            residual_offset_range: Learned residual offset range in pixel units.
+            residual_offset_range: Learned residual offset range in pixel units (`guided`).
             base_scale_multiplier: Multiplier applied to motion-derived base expansion.
             base_scale_min: Minimum base expansion in pixel units.
             base_scale_max: Maximum base expansion in pixel units.
@@ -665,11 +694,22 @@ class SparseTemporalFusionBlock(nn.Module):
                 motion-based expansion and fixed `base_fixed_expansion_no_motion`.
             base_fixed_expansion_no_motion: Pixel expansion when below `base_motion_epsilon`.
             include_diagonal_base_offsets: Whether to include diagonal base directions.
+            offset_mode: Offset generation mode.
+                - `guided`: motion base offsets + semantic residual (default).
+                - `direct`: predict sampling offsets directly (ablation).
+            direct_offset_range: Absolute offset range for `direct` mode. Defaults to
+                `base_scale_max` when unset so large ego motion remains reachable.
             align_corners: `grid_sample` alignment mode.
             padding_mode: `grid_sample` padding mode.
             return_debug: Default debug return behavior.
         """
         super().__init__()
+        mode = str(offset_mode).lower().strip()
+        if mode not in ('guided', 'direct'):
+            raise ValueError(
+                f"offset_mode must be 'guided' or 'direct', got {offset_mode}"
+            )
+        self.offset_mode = mode
         self.return_debug = return_debug
         self.need_head = TemporalNeedHead(
             channels=channels,
@@ -686,23 +726,36 @@ class SparseTemporalFusionBlock(nn.Module):
             topk=need_topk,
             need_threshold=need_threshold,
         )
-        self.base_offset_generator = BaseOffsetGenerator(
-            point_cloud_range=point_cloud_range,
-            scale_multiplier=base_scale_multiplier,
-            min_expansion=base_scale_min,
-            max_expansion=base_scale_max,
-            motion_epsilon=base_motion_epsilon,
-            fixed_expansion_no_motion=base_fixed_expansion_no_motion,
-            include_diagonal_offsets=include_diagonal_base_offsets,
-        )
+        if self.offset_mode == 'guided':
+            self.base_offset_generator = BaseOffsetGenerator(
+                point_cloud_range=point_cloud_range,
+                scale_multiplier=base_scale_multiplier,
+                min_expansion=base_scale_min,
+                max_expansion=base_scale_max,
+                motion_epsilon=base_motion_epsilon,
+                fixed_expansion_no_motion=base_fixed_expansion_no_motion,
+                include_diagonal_offsets=include_diagonal_base_offsets,
+            )
+            predictor_num_points = int(num_points)
+            predictor_offset_range = float(residual_offset_range)
+            sampler_num_points = (
+                self.base_offset_generator.num_base_offsets * predictor_num_points
+            )
+        else:
+            self.base_offset_generator = None
+            predictor_num_points = int(num_points)
+            predictor_offset_range = float(
+                base_scale_max if direct_offset_range is None else direct_offset_range
+            )
+            sampler_num_points = predictor_num_points
         self.residual_offset_predictor = ResidualOffsetPredictor(
             channels=channels,
-            num_points=num_points,
-            offset_range=residual_offset_range,
+            num_points=predictor_num_points,
+            offset_range=predictor_offset_range,
         )
         self.temporal_sampler = TemporalSamplerAggregator(
             channels=channels,
-            num_points=self.base_offset_generator.num_base_offsets * num_points,
+            num_points=sampler_num_points,
             align_corners=align_corners,
             padding_mode=padding_mode,
         )
@@ -843,6 +896,7 @@ class SparseTemporalFusionBlock(nn.Module):
             gate_rsu=gate_rsu,
         )
         pixel_mask, window_mask, window_scores = self.window_router(need_map)
+
         if self.training and self.need_vis_counter % 30 == 0:
             self._visualize_need_maps(
                 need_map=need_map,
@@ -871,20 +925,35 @@ class SparseTemporalFusionBlock(nn.Module):
             base_direction_bank: Optional[torch.Tensor]
             base_expansion_scale: Optional[torch.Tensor]
             rigid_offset: Optional[torch.Tensor]
-            delta_p_base, rigid_offset, base_expansion_scale, base_direction_bank = self.base_offset_generator(
-                relative_pose=relative_pose,
-                height=height,
-                width=width,
-                device=current_feature.device,
-                dtype=current_feature.dtype,
-            )
-            delta_p_res = self.residual_offset_predictor(
-                current_feature=current_feature,
-                need_map=need_map,
-                relative_pose=relative_pose,
-            )
-            total_offsets = delta_p_base.unsqueeze(2) + delta_p_res.unsqueeze(1)
-            total_offsets = total_offsets.reshape(batch_size, -1, 2, height, width)
+            if self.offset_mode == 'guided':
+                assert self.base_offset_generator is not None
+                delta_p_base, rigid_offset, base_expansion_scale, base_direction_bank = (
+                    self.base_offset_generator(
+                        relative_pose=relative_pose,
+                        height=height,
+                        width=width,
+                        device=current_feature.device,
+                        dtype=current_feature.dtype,
+                    )
+                )
+                delta_p_res = self.residual_offset_predictor(
+                    current_feature=current_feature,
+                    need_map=need_map,
+                    relative_pose=relative_pose,
+                )
+                total_offsets = delta_p_base.unsqueeze(2) + delta_p_res.unsqueeze(1)
+                total_offsets = total_offsets.reshape(batch_size, -1, 2, height, width)
+            else:
+                delta_p_base = None
+                rigid_offset = None
+                base_expansion_scale = None
+                base_direction_bank = None
+                delta_p_res = self.residual_offset_predictor(
+                    current_feature=current_feature,
+                    need_map=need_map,
+                    relative_pose=relative_pose,
+                )
+                total_offsets = delta_p_res
             temporal_residual, temporal_attention, temporal_samples = self.temporal_sampler(
                 current_feature=current_feature,
                 history_feature=history_feature,

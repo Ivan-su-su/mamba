@@ -316,6 +316,145 @@ normalize_img = torchvision.transforms.Compose(
     )
 )
 
+# Night pre-lighten. Inverse of C2/C3:
+# L1: clip((I / 0.35) ** (1 / 1.8), 0, 1)
+# L2: clip((I / 0.25) ** (1 / 2.0), 0, 1)
+# TRAIN night: sample gain/gamma in the L1–L2 box, then HL.
+# TEST night: fixed L2 then HL. Depth is never lifted.
+L2_TRAIN_SCENARIO_ID = "2025_05_06_10_01_50"
+L2_TEST_SCENARIO_ID = "2025_05_10_19_54_35"
+L2_SCENARIO_IDS = (L2_TRAIN_SCENARIO_ID, L2_TEST_SCENARIO_ID)
+L1_GAIN, L1_GAMMA = 0.35, 1.8
+L2_GAIN, L2_GAMMA = 0.25, 2.0
+L2_EPS = 1e-8
+L2_HL_KNEE, L2_HL_STRENGTH = 0.50, 3.0
+L2_HL_BLEND_LO, L2_HL_BLEND_HI = 0.12, 0.35
+_IMAGENET_MEAN = [0.485, 0.456, 0.406]
+_IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
+def is_l2_train_night_scenario(metadata_path, is_train=None):
+    """True iff the path is TRAIN night ``10_01_50`` or TEST night ``19_54_35``."""
+    del is_train
+    if metadata_path is None:
+        return False
+    parts = str(metadata_path).replace("\\", "/").split("/")
+    return any(sid in parts for sid in L2_SCENARIO_IDS)
+
+
+def _apply_gain_gamma_rgb(rgb, gain, gamma, eps=L2_EPS):
+    """``clip((I / gain) ** (1 / gamma), 0, 1)`` on display RGB."""
+    out = rgb.clone() if torch.is_tensor(rgb) else torch.as_tensor(rgb)
+    rgb_ch = out[:3].clamp(min=0.0, max=1.0)
+    scaled = rgb_ch / float(gain)
+    scaled = torch.where(scaled < 0, scaled.new_full(scaled.shape, float(eps)), scaled)
+    out[:3] = torch.clamp(torch.pow(scaled, 1.0 / float(gamma)), 0.0, 1.0)
+    return out
+
+
+def _smoothstep01(x, lo, hi):
+    """Hermite smoothstep of ``x`` from ``lo`` to ``hi``, clamped to ``[0, 1]``."""
+    t = ((x - float(lo)) / (float(hi) - float(lo))).clamp(0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _night_lift_hl(rgb, gain, gamma, eps=L2_EPS):
+    """Gain-gamma lift, then the same highlight compress used by L2_hl."""
+    out = rgb.clone() if torch.is_tensor(rgb) else torch.as_tensor(rgb)
+    src = out[:3].clamp(min=0.0, max=1.0)
+    lifted = _apply_gain_gamma_rgb(out, gain, gamma, eps=eps)[:3]
+    over = (lifted - float(L2_HL_KNEE)).clamp(min=0.0)
+    lifted_c = torch.clamp(
+        lifted - over + over / (1.0 + float(L2_HL_STRENGTH) * over), 0.0, 1.0
+    )
+    luma = 0.299 * src[0] + 0.587 * src[1] + 0.114 * src[2]
+    blend = _smoothstep01(luma, L2_HL_BLEND_LO, L2_HL_BLEND_HI)
+    out = out.clone()
+    out[:3] = (1.0 - blend) * lifted_c + blend * src
+    return out
+
+
+def encode_rgb_for_p1(pil_rgb, apply_l2=False, train=False):
+    """ImageNet-normalize RGB. Night: lift+HL before mean/std. Depth stays out.
+
+    TRAIN night samples gain in ``[L2_GAIN, L1_GAIN]`` and gamma in
+    ``[L1_GAMMA, L2_GAMMA]``. TEST night is fixed L2. Non-night is ImageNet only.
+    """
+    if not apply_l2:
+        return normalize_img(pil_rgb)
+    rgb = torchvision.transforms.functional.to_tensor(pil_rgb)
+    if train:
+        gain = float(np.random.uniform(*sorted((L1_GAIN, L2_GAIN))))
+        gamma = float(np.random.uniform(*sorted((L1_GAMMA, L2_GAMMA))))
+    else:
+        gain, gamma = float(L2_GAIN), float(L2_GAMMA)
+    return imagenet_normalize_display_rgb(_night_lift_hl(rgb, gain, gamma))
+
+
+def imagenet_normalize_display_rgb(rgb):
+    """ImageNet-normalize a display RGB tensor already in ``[0, 1]``.
+
+    Args:
+        rgb: Float tensor ``[3, H, W]`` (extra channels not allowed).
+
+    Returns:
+        Normalized RGB tensor, same shape.
+    """
+    return torchvision.transforms.functional.normalize(
+        rgb, mean=_IMAGENET_MEAN, std=_IMAGENET_STD
+    )
+
+
+# TRAIN-only physics fog on non-night scenes. Not applied to L2 night folders.
+FOG_ATMOSPHERIC_LIGHT = 0.75
+FOG_SAMPLE_FRACTION = 0.40
+FOG_BETA_RANGE = {
+    "vehicle": (0.02, 0.05),
+    "rsu": (0.02, 0.05),
+    "drone": (0.001, 0.007),
+}
+FOG_EPOCH_SEED = 20260828
+FOG_FAR_M = 1000.0
+
+
+def camera_optical_ray_range(z, intrins, post_rots, post_trans, far_m=FOG_FAR_M):
+    """Euclidean ray range from optical-axis z after undoing eval post-homography.
+
+    Matches LSS ``get_geometry``: undo ``post_rots``/``post_trans``, then
+    ``rho = z * ||K^{-1}[u', v', 1]||``. ``z`` is camera optical-axis depth
+    in meters. Non-finite or ``z <= 0`` is replaced by ``far_m``.
+    """
+    z_use = z.to(dtype=torch.float32)
+    invalid = (~torch.isfinite(z_use)) | (z_use <= 0)
+    z_use = torch.where(invalid, z_use.new_full(z_use.shape, float(far_m)), z_use)
+    height, width = z_use.shape
+    ys = torch.arange(height, device=z_use.device, dtype=torch.float32)
+    xs = torch.arange(width, device=z_use.device, dtype=torch.float32)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    pix = torch.stack(
+        [grid_x, grid_y, torch.ones_like(grid_x)], dim=-1
+    )
+    k_mat = intrins.to(device=z_use.device, dtype=torch.float32)
+    post_r = post_rots.to(device=z_use.device, dtype=torch.float32)
+    post_t = post_trans.to(device=z_use.device, dtype=torch.float32).reshape(3)
+    pix_orig = torch.einsum("ij,hwj->hwi", torch.inverse(post_r), pix - post_t)
+    ray_dir = torch.einsum("ij,hwj->hwi", torch.inverse(k_mat), pix_orig)
+    return z_use * torch.linalg.norm(ray_dir, dim=-1)
+
+
+def apply_atmospheric_fog_rgb(rgb, rho, beta, atmospheric_light=FOG_ATMOSPHERIC_LIGHT):
+    """Koschmieder fog on display RGB: ``I t + A (1-t)`` with ``t=exp(-beta rho)``."""
+    rgb_ch = rgb[:3].clamp(0.0, 1.0)
+    transmission = torch.exp(-float(beta) * rho.clamp(min=0.0)).clamp(0.0, 1.0)
+    airlight = rgb_ch.new_tensor(float(atmospheric_light))
+    fogged = rgb_ch * transmission.unsqueeze(0) + airlight * (
+        1.0 - transmission.unsqueeze(0)
+    )
+    out = rgb.clone() if torch.is_tensor(rgb) else torch.as_tensor(rgb)
+    out = out.clone()
+    out[:3] = fogged.clamp(0.0, 1.0)
+    return out
+
 def decode_depth_carla(depth_map_ori, to_PIL=True): 
     
     """

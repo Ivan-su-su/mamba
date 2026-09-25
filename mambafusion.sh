@@ -7,8 +7,9 @@
 # export CUDA_PATH=/usr/local/cuda-12.1
 # export PATH=/usr/local/cuda-12.1/bin:$PATH
 # export LD_LIBRARY_PATH=/usr/local/cuda-12.1/lib64:${LD_LIBRARY_PATH}
-MODEL_DIR="/home/dell/suyi/AirV2X-Perception_copy/AirV2X-Perception-Checkpoints/airv2x_intermediate_mambafusion"
-LOG_DIR='/home/dell/suyi/AirV2X-Perception_copy/opencood/logs/airv2x_intermediate_mambafusion/default_2026_06_23_00_52_34'
+# MODEL_DIR="/home/dell/suyi/AirV2X-Perception_copy/AirV2X-Perception-Checkpoints/airv2x_intermediate_mambafusion"
+LOG_DIR=/home/dell/suyi/AirV2X-Perception_copy/AirV2X-Perception-Checkpoints/airv2x_intermediate_mambafusion
+MODEL_DIR=/home/dell/suyi/AirV2X-Perception_copy/AirV2X-Perception-Checkpoints/airv2x_intermediate_mambafusion
 # MODEL_DIR="/home/suyi/AirV2X-Perception_old/AirV2X-Perception-Checkpoints/airv2x_intermediate_where2comm/release"
 gpu_spec=${1:-0}
 train=${2:-test}
@@ -44,17 +45,20 @@ elif [ "$train" = "train" ] && [ "$ddp" = "True" ]; then
     torchrun --standalone --nproc_per_node="${nproc_per_node}" \
         opencood/tools/train.py \
         -y "${config_path}" \
+        --worker 1 \
         "${model_dir_args[@]}"
 elif [ "$train" = "train" ]; then
     if [ "$pretrained" = "True" ]; then
         python opencood/tools/train.py \
             -y "${LOG_DIR}/config.yaml" \
             --gpu_id ${gpu_spec} \
+            --worker 2 \
             --model_dir "${LOG_DIR}"
     else
         python opencood/tools/train.py \
             -y "${MODEL_DIR}/config.yaml" \
-            --gpu_id ${gpu_spec}
+            --gpu_id ${gpu_spec} \
+            --worker 2
     fi
 else
     echo "Unsupported mode: train=${train}, ddp=${ddp}"

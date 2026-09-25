@@ -410,6 +410,7 @@ model:
           FINAL_GATE_HIDDEN_DIM: 32
         SPARSE_TEMPORAL:
           ENABLE: True
+          TYPE: concat
           CUE_DISTANCE_CHANNELS: 3
           POINT_CLOUD_RANGE: [-140.8, -40.0, -3.0, 140.8, 40.0, 1.0]
           ROUTE_WINDOW: [10, 11]
